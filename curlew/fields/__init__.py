@@ -655,3 +655,4 @@ class BaseNF(BaseSF):
 from curlew.fields.analytical import LinearField, QuadraticField, PeriodicField, ListricField, EllipsoidalField
 from curlew.fields.fourier import NFF
 from curlew.fields.series import FSF
+from curlew.fields.geoinr import GeoINR, Siren

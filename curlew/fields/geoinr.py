@@ -1,85 +1,83 @@
 """
-TODO - implement neural field based on the GeoINR approach.
-"""
+Neural fields ported from GeoINR: a plain multi-layer perceptron (`GeoINR`) and
+a sine-activation network (`Siren`), both implemented as `curlew.fields.BaseNF`
+subclasses so they slot into Curlew's events/constraints/fit machinery.
 
-"""
-Implement fourier-feature based neural fields for scalar potential representation.
+Loss and fit are inherited from `curlew.fields.BaseNF` unchanged — these classes
+only build the network (`initField`) and define the forward evaluation
+(`evaluate`).
 """
 
 import curlew
-from curlew.core import HSet
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from tqdm import tqdm
 from curlew.fields import BaseNF
+
 
 class GeoINR(BaseNF):
     """
-    GeoINR-inspired neural field for interpolation of geological structures. 
-    
-    See Hillier et al., 2023 for further details: 
-    
+    GeoINR-inspired neural field for interpolation of geological structures.
+
+    A plain multi-layer perceptron mapping coordinates to a scalar potential.
+    Hidden layers use a smooth activation (``Softplus`` by default); the final
+    layer is linear. Weights use Kaiming-uniform initialisation (``fan_in``,
+    ReLU gain), mirroring GeoINR's ``Perceptron``.
+
+    See Hillier et al., 2023 for further details:
+
     `Hillier, Michael, et al. "GeoINR 1.0: an implicit neural network approach to three-dimensional geological modelling." Geoscientific Model Development 16.23 (2023): 6987-7012.`
     """
 
-    def initField(self, 
-                  hidden_layers: list = [],
+    def initField(self,
+                  hidden_dim: int = 256,
+                  num_hidden_layers: int = 3,
                   activation: nn.Module = None,
-                  rff_features: int = 8,
-                  length_scales: list = [1e2, 2e2, 3e2],
-                  stochastic_scales : bool = True,
-                  learning_rate: float = 1e-1):
+                  learning_rate: float = 1e-3,
+                  **kwargs):
         """
-            Initialise and build this neural field.
-            
-            hidden_layers : list of int, optional
-                A list of integer sizes for the hidden layers of the MLP. Default is [,], which indicates the input encoding is directly translated to the output (i.e. no hidden layers).
-            activation : nn.Module, optional
-                The activation function to use for each hidden layer. Default is None, though `nn.SiLU()` can be useful for some fields.
-            learning_rate : float
-                The learning rate of the optimizer used to train this NF.
+        Initialise and build this neural field.
+
+        Parameters
+        ----------
+        hidden_dim : int, optional
+            Width of each hidden layer. Default 256.
+        num_hidden_layers : int, optional
+            Number of hidden layers *in addition* to the input projection, so
+            the MLP has ``num_hidden_layers + 2`` linear layers in total
+            (input projection, ``num_hidden_layers`` hidden, linear output).
+            Default 3.
+        activation : nn.Module, optional
+            Activation applied between hidden layers. Default ``nn.Softplus(beta=20)``.
+        learning_rate : float, optional
+            Learning rate of the Adam optimiser. Default 1e-3.
         """
-        # -------------------- Random Fourier Features -------------------- #
+        if activation is None:
+            activation = nn.Softplus(beta=20)
         self.activation = activation
-            
-        # -------------------- MLP Construction -------------------- #
-        # Determine input dimension for the MLP
-        mlp_input_dim = self.input_dim
 
-        # Define layer shapes
-        self.dims = [mlp_input_dim] + hidden_layers + [self.output_dim]
-
-        # Build layers in nn.Sequential
+        # Linear stack: input_dim -> hidden_dim -> ... -> output_dim.
+        # Activation between hidden layers; final layer linear (mirrors GeoINR `INR`).
         layers = []
-        for i in range(len(self.dims) - 2):
-            layers.append(nn.Linear(self.dims[i], self.dims[i + 1],
-                                    device=curlew.device, dtype=curlew.dtype))
-            if self.activation is not None:
-                layers.append(self.activation)
+        in_d = self.input_dim
+        for _ in range(num_hidden_layers + 1):  # input projection + hidden layers
+            lin = nn.Linear(in_d, hidden_dim, device=curlew.device, dtype=curlew.dtype)
+            nn.init.kaiming_uniform_(lin.weight, mode='fan_in', nonlinearity='relu')
+            layers.append(lin)
+            layers.append(self.activation)
+            in_d = hidden_dim
+        final = nn.Linear(in_d, self.output_dim, device=curlew.device, dtype=curlew.dtype)
+        nn.init.kaiming_uniform_(final.weight, mode='fan_in', nonlinearity='relu')
+        layers.append(final)
+        self.mlp = nn.Sequential(*layers)
 
-        # Final layer
-        layers.append(nn.Linear(self.dims[-2], self.dims[-1],
-                                device=curlew.device, dtype=curlew.dtype))
-        self.mlp = nn.Sequential(*layers) # Combine layers into nn.Sequential
-
-        # Xavier initialization
-        for layer in self.mlp:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_normal_(layer.weight)
-                
-        # push onto device
+        # push onto device and initialise the optimiser
         self.to(curlew.device)
-
-        # Initialise optimiser used for this MLP.
         self.init_optim(lr=learning_rate)
-        
+
     def evaluate(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the network to create a scalar value or property estimate.
-
-        If random Fourier features are enabled, the input is first encoded accordingly.
 
         Parameters
         ----------
@@ -91,20 +89,99 @@ class GeoINR(BaseNF):
         torch.Tensor
             A tensor of shape (N, output_dim), representing the scalar potential.
         """
-        # Pass through all layers and return
-        out = self.scale * self.mlp(x)
-        return out
-    
-    def loss(self, transform=True) -> torch.Tensor:
+        return self.scale * self.mlp(x)
+
+
+class _SineLayer(nn.Module):
+    """
+    A single sine-activation layer (ports GeoINR's ``SineLayer``):
+    ``forward = sin(omega_0 * linear(x))``.
+
+    Weight init: first layer ``U(-1/in, 1/in)``; subsequent layers
+    ``U(-sqrt(6/in)/omega_0, sqrt(6/in)/omega_0)``.
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 is_first: bool = False, omega_0: float = 30.0):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features,
+                                device=curlew.device, dtype=curlew.dtype)
+        with torch.no_grad():
+            if is_first:
+                bound = 1.0 / in_features
+            else:
+                bound = np.sqrt(6.0 / in_features) / omega_0
+            self.linear.weight.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
+class Siren(BaseNF):
+    """
+    Sine-activation neural field (ports GeoINR's ``Siren``; Sitzmann et al., 2020).
+
+    A stack of `_SineLayer`s (``sin(omega_0 * Wx + b)``) followed by a linear
+    output layer. The first layer is scaled by ``omega0`` and subsequent layers
+    by ``omega``; weight bounds follow the standard SIREN initialisation so
+    activations stay well-conditioned through depth.
+    """
+
+    def initField(self,
+                  hidden_dim: int = 256,
+                  num_hidden_layers: int = 3,
+                  omega0: float = 2.0,
+                  omega: float = 30.0,
+                  learning_rate: float = 1e-4,
+                  **kwargs):
         """
-        Compute the loss associated with this neural field given its current state.
+        Initialise and build this neural field.
+
+        Parameters
+        ----------
+        hidden_dim : int, optional
+            Width of each hidden layer. Default 256.
+        num_hidden_layers : int, optional
+            Number of hidden sine layers after the first. Default 3.
+        omega0 : float, optional
+            Frequency scale of the first sine layer. Default 2.0.
+        omega : float, optional
+            Frequency scale of subsequent sine layers (and the bound on the
+            final linear init). Default 30.0.
+        learning_rate : float, optional
+            Learning rate of the Adam optimiser. Default 1e-4.
         """
-        C = self.C # curlew-style constraints
-        return super().loss(transform) # todo some funky loss 
-    
-    def fit(self, epochs, C=None, **kwargs):
+        layers = [_SineLayer(self.input_dim, hidden_dim, is_first=True, omega_0=omega0)]
+        for _ in range(num_hidden_layers):
+            layers.append(_SineLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega))
+
+        final = nn.Linear(hidden_dim, self.output_dim,
+                          device=curlew.device, dtype=curlew.dtype)
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / hidden_dim) / omega
+            final.weight.uniform_(-bound, bound)
+        layers.append(final)
+        self.mlp = nn.Sequential(*layers)
+
+        # push onto device and initialise the optimiser
+        self.to(curlew.device)
+        self.init_optim(lr=learning_rate)
+
+    def evaluate(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Train this neural field using the specified constraints.
+        Forward pass of the network to create a scalar value or property estimate.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            A tensor of shape (N, input_dim), where N is the batch size.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (N, output_dim), representing the scalar potential.
         """
-        return super().fit(epochs, C=C, **kwargs)
-    
+        return self.scale * self.mlp(x)

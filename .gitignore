@@ -30,5 +30,8 @@ sandbox
 .cursor/
 .literature/
 
+# claude
+.claude/
+
 # MACOSX
 .DS_STORE
