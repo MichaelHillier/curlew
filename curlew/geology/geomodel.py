@@ -10,7 +10,7 @@ from curlew.geometry import Grid, Transform
 
 import numpy as np
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm  # notebook-aware: single updating bar in Jupyter, plain bar in a terminal
 import io
 
 
@@ -185,7 +185,7 @@ class GeoModel( LearnableBase ):
             out[F.name] = pebble
         return out
 
-    def fit(self, epochs, early_stop=(100, 1e-4), custom_loss=None, best=True, vb=True, prefix='Training'):
+    def fit(self, epochs, early_stop=(100, 1e-4), custom_loss=None, best=True, vb=True, prefix='Training', history=False):
         """
         Train all GeoEvents in this model to fit the specified constraints
         simultaneously.
@@ -207,22 +207,29 @@ class GeoModel( LearnableBase ):
             Display a tqdm progress bar to monitor training.
         prefix : str, optional
             The prefix used for the tqdm progress bar.
+        history : bool, optional
+            If True, also return the per-epoch loss history as a list of detached
+            ``curlew.core.Pebble`` snapshots (one per epoch). Each carries the full per-term
+            breakdown; ``pebble.total()`` gives that epoch's total loss. Default is False.
 
         Returns
         -------
         loss : float
             The loss of the final (best if best=True) model state.
         pebble : curlew.core.Pebble
-            A detailed breakdown of the final loss. 
+            A detailed breakdown of the final loss.
+        history : list of curlew.core.Pebble, optional
+            Per-epoch detached loss snapshots. Only returned when ``history=True``.
         """
         bar = range(epochs)
         if vb:
-            bar = tqdm(range(epochs), desc=prefix, bar_format="{desc}: {n_fmt}/{total_fmt}|{postfix}")
+            bar = tqdm(range(epochs), desc=prefix, bar_format="{desc} {bar} {n_fmt}/{total_fmt} {postfix}")
 
         best_loss = np.inf
         best_pebble = None
         best_count = 0
         eps = early_stop[1] if early_stop is not None else 0
+        hist = [] if history else None
 
         if custom_loss is None:
             custom_loss = []
@@ -234,6 +241,8 @@ class GeoModel( LearnableBase ):
             for loss_func in custom_loss:
                 pebble = pebble + loss_func(pebble, self, self.C) # add custom loss functions if they have been defined
             total = pebble.total() # compute total loss
+            if history:
+                hist.append(pebble.detach()) # record per-epoch loss snapshot
             if total.item() < (best_loss + eps):
                 best_loss = total.item()
                 best_pebble = pebble.detach()
@@ -266,6 +275,8 @@ class GeoModel( LearnableBase ):
             pebble.total().backward()
             pebble.step(exclude=exclude)
 
+        if history:
+            return best_loss, best_pebble, hist
         return best_loss, best_pebble
 
     def predict(self, x : np.ndarray, coords="global", **kwargs):

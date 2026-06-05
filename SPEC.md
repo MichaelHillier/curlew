@@ -380,6 +380,62 @@ check.
   truncates A where B's package sits above the unconformity, for both the seeded
   and learnable-iso cases.
 
+### 8.1 Findings (from the depositional `multilayer_fold` pass)
+
+These resolve/refine the open items above and should guide the wcsb pass:
+
+- **Build constraints in *model* coords; transform seeds yourself.** Construct every
+  `CSet` with `crs='model'` and map `addIsosurface(seed=...)` points into model
+  coords before attaching. `GeoModel.T` (global→model) is applied by `predict` but
+  **not** when `getIsovalues` evaluates seeds through the event's `forward`, so
+  mixing global constraints (auto-rebound) with global seeds (not rebound) misaligns
+  recovered iso-values. Keep constraints, seeds and `gv` all in model space.
+
+- **The field magnitude is an unconstrained gauge.** Normalized `gv`, mean-normalised
+  `eq` and sign-only `iq` are all scale-free, so the field range can drift or collapse
+  to a trivial minimum. In the depositional path, `eq_loss≈10` (with the default
+  output `scale`) holds contacts apart; too-small `scale` collapses them, too-large
+  `eq` destabilises. **For wcsb (fields are `iq`-only — no `eq`/`gv`) this is acute:**
+  both offset and scale are free, so the learnable-iso fallback must *actively anchor
+  the gauge* (e.g. a hinge placing the iso between the above/below pools) or the field
+  collapses / the net learns a shortcut. A principled option worth porting is GeoINR's
+  residual normalization: divide scalar differences (`f(p_i) − iso`, where `iso` is the
+  learnable value or the per-interface mean) by **‖∇f‖**, so residuals stay meaningful
+  when the gradient is small across the domain — optionally implement GeoINR-style
+  `eq`/`iq` losses this way.
+
+- **`derive_scalar_fields` does NOT emit the region-only basement.** It only appends a
+  depositional field when it has ≥1 horizon, so a lone basement (no internal contact)
+  yields no field. The builder must **synthesize the basement event itself**
+  (oldest-first, region-only, empty/near-empty `CSet`) before the first unconformity —
+  do not rely on the partitioner for it.
+
+- **§4.4 is largely handled by the loss already.** The `iq` loss samples `ns` index
+  pairs **with replacement, per `(P1,P2)` pool, each step**, and `ns` is global — so
+  per-pair / per-interface balance is automatic regardless of point counts. Remaining
+  wcsb work: `cap_per_unit` at **load**, and construct **one pool per unit/contact** so
+  rare units are represented. Store only **one direction per pair** (`younger > older`);
+  the reverse is implied — do not add `<` duplicates.
+
+- **Oscillation is a smoothness problem, not a field-type problem.** `Siren`
+  (`omega0=2, omega=30`) is init-sensitive on sparse data: it fits normals perfectly
+  but can oscillate between them (and a "good" CPU seed can be wild on GPU, since CUDA
+  RNG ≠ CPU RNG). Keep `Siren` for fitting capacity — switching to softplus/`GeoINR`
+  removes oscillation but, via INR spectral bias, reduces ability to fit points (only
+  fine for simple sets like `multilayer_fold`). The right fix is a **global smoothness
+  prior**: curlew's `mono_loss`, or a "no-overturn" trend term (≈ curlew's flat/trend
+  loss / GeoINR's no-overturn) that penalises gradients pointing in −z. Add this rather
+  than lowering capacity.
+
+- **Tooling available for the wcsb notebook.** The observation loader landed in
+  `curlew/io.py` (`loadObservations` / `Observations`, pyvista lazy/guarded).
+  `GeoModel.fit(..., history=True)` returns per-epoch detached `Pebble`s for the loss
+  curve (progress bar is now `tqdm.auto`) — use it instead of a `custom_loss` callback.
+  For napari, add **separate layers** (`addVolume` for scalar/units + per-event
+  `G.contour`→`addMesh` for surfaces; `addGeode`'s bundled surface path was
+  unreliable), all in world coords. Fit on **all data — no train/validation holdout**
+  (validation belongs to later ensemble work).
+
 ---
 
 ## 9. Environment & dependencies

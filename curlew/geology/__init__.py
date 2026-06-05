@@ -419,5 +419,8 @@ def domainBoundary( name, *, C, bound = 0, gt = 0, lt = 1, mode="below",
     # build linked list for gt and lt domains
     _linkE( gt + [f])
     _linkE( lt + [f])
-    
+
     return f
+
+# strat-column → GeoModel builder (imported last so `strati` etc. are defined)
+from curlew.geology.stratbuilder import build_geomodel

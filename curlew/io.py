@@ -243,3 +243,288 @@ def loadPLY(path):
     if faces is None:
         del out['faces']
     return out
+
+
+# ---------------------------------------------------------------------------
+# Observation loading (point observations for the strat-column builder)
+# ---------------------------------------------------------------------------
+# A thin loader producing per-level point arrays (coords + level), supporting
+# the formats found in the GeoINR data directories:
+#   - ``.vtp``  : points, a ``level`` point-array, optional ``normals`` array
+#                 (read via pyvista, kept an optional/lazily-imported dependency)
+#   - ``.csv``  : ``x,y[,z],level`` with optional ``is_interface`` and
+#                 ``nx,ny[,nz]`` columns.
+# Points are grouped by ``level`` so the builder can assemble per-interface
+# seeds/traces and per-unit inequality pairs (see ``curlew.geology.stratbuilder``).
+
+from dataclasses import dataclass, field as _dcfield
+
+
+@dataclass
+class Observations:
+    """
+    Point observations grouped by stratigraphic ``level``, used by
+    :func:`curlew.geology.stratbuilder.build_geomodel`.
+
+    Each row is one observed point. Points play one of three roles, distinguished
+    by :attr:`is_interface` and whether a normal vector is present:
+
+    - **interface / contact points** — ``is_interface`` is True; sampled on a
+      stratigraphic contact (used for equality traces and seed isosurfaces).
+    - **gradient (normal) points** — a finite vector in :attr:`normals`; an
+      oriented bedding normal (used for ``gv`` gradient constraints).
+    - **unit points** — ``is_interface`` is False and no normal; an observation of
+      a unit's interior (used for inequality pairs / region labelling).
+
+    Attributes
+    ----------
+    coords : np.ndarray
+        ``(N, d)`` point positions in global (world) coordinates.
+    level : np.ndarray
+        ``(N,)`` integer stratigraphic level per point (``-1`` if unknown).
+    normals : np.ndarray
+        ``(N, d)`` bedding normals; rows without a normal are ``NaN``.
+    is_interface : np.ndarray
+        ``(N,)`` boolean flag, True for on-contact (interface) points.
+    """
+
+    coords: np.ndarray
+    level: np.ndarray
+    normals: np.ndarray
+    is_interface: np.ndarray
+
+    @property
+    def ndim(self) -> int:
+        """Spatial dimensionality of the observation coordinates."""
+        return self.coords.shape[1]
+
+    def __len__(self):
+        return self.coords.shape[0]
+
+    def _has_normal(self) -> np.ndarray:
+        """Boolean mask of rows that carry a (finite) normal vector."""
+        return np.isfinite(self.normals).all(axis=1)
+
+    def levels(self, role: str = "all") -> list:
+        """
+        Sorted list of distinct (non-negative) levels present for the given role.
+
+        Parameters
+        ----------
+        role : str
+            One of ``"all"``, ``"interface"`` or ``"unit"``.
+        """
+        if role == "interface":
+            mask = self.is_interface
+        elif role == "unit":
+            mask = (~self.is_interface) & (~self._has_normal())
+        else:
+            mask = np.ones(len(self), dtype=bool)
+        lv = self.level[mask & (self.level >= 0)]
+        return sorted(int(v) for v in np.unique(lv))
+
+    def by_level(self, role: str = "interface") -> dict:
+        """
+        Group point coordinates by level for the requested role.
+
+        Parameters
+        ----------
+        role : str
+            ``"interface"`` (on-contact points), ``"unit"`` (interior unit points),
+            or ``"all"``.
+
+        Returns
+        -------
+        dict[int, np.ndarray]
+            Maps each level to an ``(n, d)`` array of coordinates.
+        """
+        if role == "interface":
+            base = self.is_interface
+        elif role == "unit":
+            base = (~self.is_interface) & (~self._has_normal())
+        else:
+            base = np.ones(len(self), dtype=bool)
+        out = {}
+        for L in self.levels(role):
+            out[L] = self.coords[base & (self.level == L)]
+        return out
+
+    def interface_points(self):
+        """Return ``(coords, level)`` for all on-contact (interface) points."""
+        m = self.is_interface
+        return self.coords[m], self.level[m]
+
+    def unit_points(self):
+        """Return ``(coords, level)`` for interior unit points (non-contact, no normal)."""
+        m = (~self.is_interface) & (~self._has_normal())
+        return self.coords[m], self.level[m]
+
+    def normal_points(self):
+        """Return ``(coords, normals, level)`` for points carrying a bedding normal."""
+        m = self._has_normal()
+        return self.coords[m], self.normals[m], self.level[m]
+
+    def bounds(self):
+        """Return ``(min, max)`` corner coordinates of the observed points."""
+        return self.coords.min(axis=0), self.coords.max(axis=0)
+
+
+def _read_vtp(path):
+    """
+    Read a ``.vtp`` polydata file with pyvista (lazily imported).
+
+    Mirrors GeoINR's reader: any point-data array whose name contains ``"level"``
+    (case-insensitive) is taken as the level array; any containing ``"normal"`` as
+    the normals array.
+
+    Returns
+    -------
+    tuple
+        ``(points (N,3), level (N,) or None, normals (N,3) or None)``.
+    """
+    try:
+        import pyvista as pv
+    except ImportError as exc:  # keep pyvista optional per repo convention
+        raise ImportError(
+            "Reading .vtp observations requires pyvista. "
+            "Install with `conda install -c conda-forge pyvista` (or `pip install pyvista`)."
+        ) from exc
+
+    poly = pv.read(str(path))
+    level = None
+    normals = None
+    for name in poly.point_data.keys():
+        low = name.lower()
+        if "level" in low:
+            level = np.asarray(poly.point_data[name]).reshape(-1)
+        if "normal" in low:
+            normals = np.asarray(poly.point_data[name])
+    return np.asarray(poly.points), level, normals
+
+
+def _read_csv_obs(path):
+    """
+    Read a ``.csv`` of point observations.
+
+    Expects columns ``x, y[, z], level`` and optionally ``is_interface`` and
+    normals (``nx, ny[, nz]``). Column matching is case-insensitive.
+
+    Returns
+    -------
+    tuple
+        ``(points (N,d), level (N,) or None, normals (N,d) or None,
+        is_interface (N,) bool or None)``.
+    """
+    import csv as _csv
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        reader = _csv.DictReader(fh)
+        cols = {c.strip().lower(): c for c in (reader.fieldnames or [])}
+        rows = list(reader)
+
+    def col(name):
+        return cols.get(name)
+
+    axes = [a for a in ("x", "y", "z") if a in cols]
+    naxes = [a for a in ("nx", "ny", "nz") if a in cols]
+
+    def fcol(row, name):
+        return float(row[cols[name]])
+
+    pts = np.array([[fcol(r, a) for a in axes] for r in rows], dtype=float)
+    level = None
+    if "level" in cols:
+        level = np.array([int(float(r[col("level")])) for r in rows], dtype=int)
+    normals = None
+    if len(naxes) == len(axes) and len(naxes) > 0:
+        normals = np.array([[fcol(r, a) for a in naxes] for r in rows], dtype=float)
+    is_interface = None
+    if "is_interface" in cols:
+        is_interface = np.array(
+            [str(r[col("is_interface")]).strip().lower() in ("1", "true", "yes") for r in rows],
+            dtype=bool,
+        )
+    return pts, level, normals, is_interface
+
+
+def _coerce_paths(arg):
+    """Normalise a path / list-of-paths argument to a list (possibly empty)."""
+    if arg is None:
+        return []
+    if isinstance(arg, (str, os.PathLike)):
+        return [arg]
+    return list(arg)
+
+
+def loadObservations(interfaces=None, normals=None, units=None):
+    """
+    Load point observations for the strat-column builder, merging one or more
+    files into a single :class:`Observations`.
+
+    The *role* of each file is given explicitly (mirroring GeoINR's separate
+    interface/unit/normal file arguments), since a level-only ``.vtp`` is
+    ambiguous between contact points and unit markers. A ``.csv`` may further
+    refine the role per-row via an ``is_interface`` column and may carry normals.
+
+    Parameters
+    ----------
+    interfaces : str | os.PathLike | list, optional
+        File(s) of on-contact points (``.vtp`` with a ``level`` array, or ``.csv``).
+        Points are flagged ``is_interface=True`` unless a CSV ``is_interface`` column
+        says otherwise.
+    normals : str | os.PathLike | list, optional
+        File(s) of oriented bedding normals (``.vtp`` with a ``normals`` array, or
+        ``.csv`` with ``nx,ny[,nz]``). A ``level`` is used if present, else ``-1``.
+    units : str | os.PathLike | list, optional
+        File(s) of interior unit points (level labels only).
+
+    Returns
+    -------
+    Observations
+        Merged observations with per-point ``coords``, ``level``, ``normals`` and
+        ``is_interface`` arrays.
+    """
+    coords_all, level_all, normals_all, isint_all = [], [], [], []
+
+    def _add(path, role):
+        path = Path(path)
+        if path.suffix.lower() == ".vtp":
+            pts, lvl, nrm = _read_vtp(path)
+            isint = None
+        elif path.suffix.lower() == ".csv":
+            pts, lvl, nrm, isint = _read_csv_obs(path)
+        else:
+            raise ValueError(f"Unsupported observation format: {path.suffix} ({path}).")
+
+        n, d = pts.shape
+        if lvl is None:
+            lvl = np.full(n, -1, dtype=int)
+        else:
+            lvl = np.asarray(lvl).round().astype(int).reshape(-1)
+        full_nrm = np.full((n, d), np.nan, dtype=float)
+        if nrm is not None:
+            full_nrm[:] = np.asarray(nrm)[:, :d]
+        if isint is None:
+            isint = np.full(n, role == "interfaces", dtype=bool)
+
+        coords_all.append(pts)
+        level_all.append(lvl)
+        normals_all.append(full_nrm)
+        isint_all.append(isint)
+
+    for p in _coerce_paths(interfaces):
+        _add(p, "interfaces")
+    for p in _coerce_paths(normals):
+        _add(p, "normals")
+    for p in _coerce_paths(units):
+        _add(p, "units")
+
+    if not coords_all:
+        raise ValueError("loadObservations: no observation files provided.")
+
+    return Observations(
+        coords=np.vstack(coords_all),
+        level=np.concatenate(level_all),
+        normals=np.vstack(normals_all),
+        is_interface=np.concatenate(isint_all),
+    )

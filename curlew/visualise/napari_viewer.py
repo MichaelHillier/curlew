@@ -717,6 +717,12 @@ class NapariViewer:
             opts["affine"] = affine_use
         opts.update(kwargs)
 
+        # vispy uploads volumes to a GPU texture: hand it a C-contiguous float32
+        # array. The (2,1,0) transpose above yields a non-contiguous, reversed-stride
+        # view, and float64 is not a native texture format — both can break the 3D
+        # ``iso``/``attenuated_mip`` rendering paths ("Volume visual needs a 3D array").
+        volume = np.ascontiguousarray(volume, dtype=np.float32)
+
         self._remove_layer_if_present(name)
         layer = self.viewer.add_image(volume, **opts)
         self._layers[name] = layer
