@@ -108,6 +108,12 @@ class GeoEvent( object ):
         self.propertyField = propertyField # forward (property) prediction, if defined
 
         self.isosurfaces = {} # this will hold any added isosurfaces
+        # optional per-isosurface lithology label: maps an isosurface name to the name of the
+        # lithology it bounds (the band immediately *above* it). Defaults to the isosurface name
+        # itself, so existing models are unchanged; the unit-only builder uses it to name a
+        # contact after the unit whose TOP it is while still labelling the (younger) band above
+        # it correctly. See :meth:`addOrderedIsosurfaces`.
+        self.iso_litho = {}
         self.anchors = {} # named anchor points in modern-day coordinates (paleo positions via getAnchor)
         self.volumes = {} # named boolean volumes (boolean functional domains; evaluated via getVolume)
         self.llookup = None # this will be defined if lithology IDs have been defined
@@ -546,8 +552,8 @@ class GeoEvent( object ):
                     values = np.array(list(iso_values.values()))
                     ixx = np.argsort(values) # sort these to ensure isosurfaces are applied from smallest to largest
                     for i,(k,v) in enumerate(zip(keys[ixx], values[ixx])):
-                        k = f"{self.name}_{k}" # include field name in k to help ensure it is unique!
-                        mask = out.scalar >= v # isosurface is formation top
+                        k = f"{self.name}_{self.iso_litho.get(k, k)}" # litho label of the band above this iso (defaults to the iso name)
+                        mask = out.scalar >= v # band above the isosurface gets its lithology
                         if self.llookup is not None:
                             assert k in self.llookup, "Lithology lookup must contain all isosurfaces in generative fields"
                             i = self.llookup[k]
@@ -770,17 +776,23 @@ class GeoEvent( object ):
         else:
             return offset
 
-    def addIsosurface( self, name :str, *, value = None, seed = None, field=0):
+    def addIsosurface( self, name :str, *, value = None, seed = None, learnable = None, field=0):
         """
         Add a (geologically meaningful) isosurface to this scalar field. These
         represent e.g., stratigraphic contacts and (when determining lithology IDs)
         are interpreted as formation tops.
 
-        Note that isosurfaces can be defined in two ways:
+        Note that isosurfaces can be defined in three ways:
 
         1. by specifying their value directly (`value=x`)
-        2. by specifying a location (`seed_point`) at with the scalar field
+        2. by specifying a location (`seed`) at which the scalar field
            should be evaluated to determine the scalar value.
+        3. by specifying a `learnable` initial value, which creates a learnable
+           iso-value on the underlying field (optimised during ``fit``). This is
+           used where there are no on-surface points to seed from (e.g. unconformities
+           constrained only by units above/below — see :attr:`curlew.core.CSet.sb`).
+           The same learnable value can serve as the :class:`~curlew.geology.interactions.Overprint`
+           threshold and the extraction iso.
 
         Parameters
         ----------
@@ -789,20 +801,52 @@ class GeoEvent( object ):
         value : float, None
             A value to explicitely set the isosurface value.
         seed : np.ndarray, None
-            A position (x,y,[z]) or list of positions that implicitly define the 
-            isosurface value. Whatever value is returned by the model at this 
-            location will be used to define the isosurface value). 
+            A position (x,y,[z]) or list of positions that implicitly define the
+            isosurface value. Whatever value is returned by the model at this
+            location will be used to define the isosurface value).
 
             If several points are provided (e.g., known contact locations),
             the mean of their outputs used to determine the isosurface value.
+        learnable : float, None
+            Initial value for a learnable iso-value created on the underlying field.
         field : specify which sub-field of this GeoEvent instance this isosurface is associated to. Defaults to 0 (first field).
         """
-        assert (seed is None) or (value is None), "Either seed or value should be defined, not both."
-        assert not( (seed is None) and (value is None)), "Either seed or value should be defined, not both."
+        provided = [x is not None for x in (value, seed, learnable)]
+        assert sum(provided) == 1, "Exactly one of value, seed or learnable must be defined."
         if seed is not None:
             self.isosurfaces[name] = (field, _numpy( seed ))
         if value is not None:
             self.isosurfaces[name] = (field, value)
+        if learnable is not None:
+            fobj = self.getField(field)
+            assert hasattr(fobj, "add_iso"), "learnable iso-values require a learnable field (curlew.fields.BaseSF)."
+            fobj.add_iso(name, float(learnable))   # creates the nn.Parameter on the field
+            self.isosurfaces[name] = (field, ('learnable', name))
+
+    def addOrderedIsosurfaces(self, names, inits, litho=None, field=0):
+        """
+        Add a **monotone group** of learnable isosurfaces (e.g. the conformable contacts of one
+        depositional package), given youngest→oldest with strictly decreasing ``inits``. Unlike
+        repeated :meth:`addIsosurface` calls with ``learnable=``, the underlying iso-values are
+        reparameterised on the field so they are ordered *by construction* and can never cross
+        (see :meth:`curlew.fields.BaseSF.add_ordered_isos`). Each name serves as its own
+        ``Overprint`` threshold / extraction iso, exactly like a single learnable isosurface.
+
+        ``litho`` (optional, same length as ``names``) gives the **lithology label** for each
+        contact — the name of the band it bounds from below (the band immediately above it).
+        This lets a contact be *named* after the unit whose top it is (the older band) while the
+        lithology stays attached to the correct (younger) band. Defaults to ``names``.
+        """
+        fobj = self.getField(field)
+        assert hasattr(fobj, "add_ordered_isos"), \
+            "ordered iso-values require a learnable field (curlew.fields.BaseSF)."
+        names = list(names)
+        litho = list(litho) if litho is not None else list(names)
+        assert len(litho) == len(names)
+        fobj.add_ordered_isos(names, list(inits))
+        for nm, lab in zip(names, litho):
+            self.isosurfaces[nm] = (field, ('learnable', nm))
+            self.iso_litho[nm] = lab
 
     def addAnchor( self, name: str, position: ArrayLike = None, *, direction: ArrayLike = None, start: ArrayLike = None, end: ArrayLike = None, field=0 ):
         """
@@ -962,7 +1006,10 @@ class GeoEvent( object ):
                 fieldName, v = v # expand
             fobj = self.getField(fieldName)
 
-            if isinstance(v, np.ndarray) or isinstance(v, list):
+            if isinstance(v, tuple) and len(v) == 2 and v[0] == 'learnable':
+                # learnable iso-value held on the underlying field
+                i = fobj.get_iso(v[1]).detach().item()
+            elif isinstance(v, np.ndarray) or isinstance(v, list):
                 v = np.array(v)
                 if len(v.shape) == 1:
                     v = v[None, :]

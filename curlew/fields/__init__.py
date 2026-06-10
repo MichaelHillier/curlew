@@ -79,6 +79,16 @@ class BaseSF(LearnableBase):
         self.name = name
         if self.name is None:
             self.name = str(type(self).__name__) # default name is the name of the field type
+        # learnable iso-values owned by this field (GeoINR-style), keyed by name via _iso_index.
+        # Used by ``sb`` (stratigraphic-bound) losses and resolved by the owning GeoEvent's
+        # isosurfaces / overprint thresholds. Empty by default (no effect on existing fields).
+        # ``_iso_index`` maps name -> ('free', idx) for an independent value (held in
+        # ``iso_values``) or ('mono', group, pos) for one member of a **monotone group**
+        # (held in ``_iso_mono``): a set of iso-values that are ordered *by construction* so
+        # they can approach but never cross (see :meth:`add_ordered_isos`).
+        self.iso_values = nn.ParameterList()   # independent (free) iso-values
+        self._iso_mono = nn.ParameterList()    # one vector theta per monotone group
+        self._iso_index = {}
         if input_dim is None:
             self.input_dim = curlew.default_dim
         else:
@@ -109,6 +119,75 @@ class BaseSF(LearnableBase):
         by child classes.
         """
         assert False, "BaseNF does not implement initField()"
+
+    def init_optim(self, method=optim.Adam, lr=1e-2, iso_lr=None, **kwargs):
+        """
+        Initialise the optimiser for this field. Overrides :meth:`LearnableBase.init_optim`
+        to optionally place the learnable iso-values (:attr:`iso_values`) in a separate
+        parameter group with learning rate ``iso_lr`` (GeoINR uses ~10x the field rate so
+        the iso-values track the field). When ``iso_lr`` is ``None`` (default) all parameters
+        share ``lr`` exactly as before.
+        """
+        iso_params = list(self.iso_values.parameters()) if hasattr(self, 'iso_values') else []
+        if hasattr(self, '_iso_mono'):
+            iso_params += list(self._iso_mono.parameters())
+        if iso_params and (iso_lr is not None):
+            iso_ids = {id(p) for p in iso_params}
+            base = [p for p in self.parameters() if id(p) not in iso_ids]
+            self.optim = method([
+                {'params': base, 'lr': lr},
+                {'params': iso_params, 'lr': iso_lr},
+            ], **kwargs)
+        else:
+            self.optim = method(self.parameters(), lr=lr, **kwargs)
+
+    def add_iso(self, name: str, init: float = 0.0):
+        """
+        Create (or return) an independent learnable iso-value named ``name`` on this field.
+        Re-call :meth:`init_optim` afterwards so the new parameter is optimised.
+        """
+        if name in self._iso_index:
+            return self.get_iso(name)
+        self._iso_index[name] = ('free', len(self.iso_values))
+        self.iso_values.append(nn.Parameter(_tensor(float(init)).reshape(())))
+        return self.iso_values[-1]
+
+    def add_ordered_isos(self, names, inits):
+        """
+        Create a **monotone group** of learnable iso-values named ``names`` (given
+        youngest→oldest, with strictly decreasing ``inits``). The group is reparameterised as
+        ``iso[0] = theta[0]`` and ``iso[j] = theta[0] - Σ_{i<=j} softplus(theta[i])``, so the
+        values are ordered (decreasing) *by construction* — they can pinch together to zero gap
+        but can never cross. Used for the conformable contacts of a depositional package so the
+        field's interfaces stay correctly ordered even where a thin band is poorly separated.
+        Re-call :meth:`init_optim` afterwards so the new parameters are optimised.
+        """
+        names = list(names)
+        inits = [float(v) for v in inits]
+        assert len(names) == len(inits) and len(names) >= 1
+        g = len(self._iso_mono)
+        theta = [inits[0]]
+        for j in range(len(inits) - 1):
+            gap = max(inits[j] - inits[j + 1], 1e-3)      # enforce a strictly positive gap
+            theta.append(float(np.log(np.expm1(gap))))    # inverse-softplus so softplus(theta)=gap
+        self._iso_mono.append(nn.Parameter(_tensor(theta)))
+        for pos, nm in enumerate(names):
+            self._iso_index[nm] = ('mono', g, pos)
+        return [self.get_iso(nm) for nm in names]
+
+    def get_iso(self, name: str):
+        """Return the learnable iso-value tensor named ``name`` (raises if undefined).
+
+        For a monotone-group member the value is *computed* (``theta[0] - Σ softplus(theta)``)
+        so it carries gradients and stays ordered relative to its group."""
+        entry = self._iso_index[name]
+        if entry[0] == 'free':
+            return self.iso_values[entry[1]]
+        _, g, pos = entry
+        theta = self._iso_mono[g]
+        if pos == 0:
+            return theta[0]
+        return theta[0] - torch.nn.functional.softplus(theta[1:pos + 1]).sum()
 
     def evaluate(x):
         """
@@ -279,7 +358,8 @@ class BaseSF(LearnableBase):
 
         # inititialize different loss parts
         L = {}
-        for k in ['value_loss', 'grad_loss', 'ori_loss', 'thick_loss', 'mono_loss', 'flat_loss', 'iq_loss', 'eq_loss']:
+        for k in ['value_loss', 'grad_loss', 'ori_loss', 'thick_loss', 'mono_loss', 'flat_loss',
+                  'iq_loss', 'eq_loss', 'sb_loss', 'overturn_loss']:
             L[k] = 0
 
         # LOCAL LOSS FUNCTIONS
@@ -433,6 +513,72 @@ class BaseSF(LearnableBase):
                         six_list[c][keep_ix].detach(),
                         eix_list[c][keep_ix].detach(),
                     ))
+
+        # Stratigraphic-bound loss (GeoINR-style): each point set should sit above ('>') or
+        # below ('<') a named learnable iso-value. The residual is normalised by the gradient
+        # norm — (f - iso)/‖∇f‖ — so it behaves like a signed distance to the iso-surface and
+        # the field cannot collapse to satisfy the bound trivially. Averaged over active
+        # violations only (so satisfied points do not dilute coherent violation clusters).
+        if (C.sb is not None) and (isinstance(H.sb_loss, str) or (H.sb_loss > 0)):
+            ns = C.sb[0]
+            # sample each entry's points, concatenate, and run a single forward+grad
+            sb_pts, sb_meta, off = [], [], 0
+            for pts, name, rel in C.sb[1]:
+                n = pts.shape[0]
+                if n == 0:
+                    continue
+                k = n if (ns is None or ns >= n) else int(ns)
+                sel = torch.randint(0, n, (k,), device=curlew.device)
+                sb_pts.append(pts[sel])
+                sb_meta.append((rel, name, slice(off, off + k)))
+                off += k
+            if sb_pts:
+                grad, val = self.gradient(torch.cat(sb_pts, dim=0), normalize=False,
+                                          transform=transform, return_value=True,
+                                          retain_graph=True, create_graph=True, accumulate=False)
+                norm = torch.norm(grad, dim=-1) + 1e-6
+                val = val.flatten()
+                # Group violations by side and SUM one above-term + one below-term (each an
+                # active-only mean over its points). This balances the two sides regardless of
+                # how many levels fall on each — a single below-level (e.g. the basement) is not
+                # drowned out by many above-levels (mirrors GeoINR's above_unit + below_unit sum).
+                above_e, below_e = [], []
+                for rel, name, sl in sb_meta:
+                    relv = (val[sl] - self.get_iso(name)) / norm[sl]
+                    if '>' in rel:   # should be above the iso → penalise points below it
+                        above_e.append(torch.clamp_max(relv, 0).abs())
+                    else:            # should be below the iso → penalise points above it
+                        below_e.append(torch.clamp_min(relv, 0))
+                sb_terms = []
+                for grp in (above_e, below_e):
+                    if not grp:
+                        continue
+                    e = torch.cat(grp)
+                    active = e[e > 0]
+                    sb_terms.append(active.mean() if active.numel() > 0
+                                    else torch.zeros((), device=curlew.device, dtype=curlew.dtype))
+                if sb_terms:
+                    L['sb_loss'] = torch.stack(sb_terms).sum()
+
+        # No-overturn regularizer (GeoINR): penalise the scalar field decreasing in the
+        # younging direction (default +last axis, or ``C.trend``) on grid samples — i.e. forbid
+        # overturned (negative-gradient) folds while still allowing dips/folds in other directions.
+        # The penalty uses the *magnitude* of the downward gradient component (NOT a normalised
+        # cosine): the gradient norm is what drives polarity correction, hammering steeply
+        # overturned regions hardest so the field stays monotone in the younging direction (this
+        # in turn keeps a field's learned iso-values correctly ordered). Note the magnitude couples
+        # to the field's output ``scale``; the unit-only path keeps that ~1 (``_FIELD_SCALE``), so
+        # the term is naturally O(1) and balanced against ``sb_loss``.
+        if (C.grid is not None) and (isinstance(H.overturn_loss, str) or (H.overturn_loss > 0)):
+            gridO = C.grid.draw(self.transform if transform else None)
+            g = self.gradient(gridO, normalize=False, transform=transform,
+                              retain_graph=True, create_graph=True, accumulate=False)
+            if C.trend is not None:
+                younging = C.trend / (torch.norm(C.trend) + 1e-8)
+                gz = (g * younging[None, :]).sum(dim=-1)
+            else:
+                gz = g[:, -1]
+            L['overturn_loss'] = torch.clamp_max(gz, 0).abs().mean()
 
         # Dynamically adjust task weights based on the inverse of real-time loss values.
         # (this ignores the magnitude of each loss term, but preserves it's gradient direction,

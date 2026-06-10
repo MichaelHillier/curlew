@@ -153,6 +153,10 @@ class CSet:
                     Note that this inequality is computed for a random set of `N` pairs sampled from `P1` and `P2`. 
         eq (tuple): Equality constraints (traces). Should be a tuple or list containing (T1, T2, T3, ..., T_N), where the scalar value of all T_N should be equal (i.e.
                     minimise the mean-normalised variance of scalar field predictions at these locations).
+        sb (tuple): Stratigraphic-bound constraints relating point sets to a (typically learnable) named iso-value. Should be a tuple ``(N, [(P, name, rel), ...])`` where each ``P`` is an
+                    ``(M, d)`` array/tensor of positions, ``name`` is the key of an iso-value held in the bound field's ``iso_values`` (see :meth:`~curlew.geology.geoevent.GeoEvent.addIsosurface`),
+                    and ``rel`` is ``'>'`` (points should sit above the iso) or ``'<'`` (below). The loss is the GeoINR-style gradient-normalised residual ``(f(P) - iso) / ‖∇f(P)‖`` hinged by ``rel`` and
+                    averaged over active violations; ``N`` points are sampled from each ``P`` per evaluation. Weighted by ``HSet.sb_loss``.
         grid (tuple, torch.tensor or np.ndarray): A `curlew.geometry.Grid` instance defining the grid used to enforce global constraints (and associated sampling strategy).
         delta (float): The step size used when computing numerical derivatives at the grid points. Default (None) is to initialise
                        as half the distance between the first and second points listed in `grid`. Larger values of delta result
@@ -175,7 +179,8 @@ class CSet:
     pv : torch.tensor = None
     iq : tuple = None # inequality constraints
     eq : tuple = None # equality constraints
-    
+    sb : tuple = None # stratigraphic-bound constraints (points above/below a named learnable iso-value)
+
     # global constraints
     grid : Grid = None # predefined grid, or params for sampling random ones
     delta : float = None # step to use when computing numerical derivatives 
@@ -186,7 +191,7 @@ class CSet:
     crs : str = 'global'
     
     # place to store offset vectors based on delta used for numerical gradient computation.
-    _offset : torch.tensor = field(init=False, default=None)  
+    _offset : torch.tensor = field(init=False, default=None)
     
     def torch(self):
         """
@@ -209,8 +214,15 @@ class CSet:
                         else:
                             o[1].append( (attr[1][i][0], attr[1][i][1], attr[1][i][2] )) # already tensors
                     attr = o
+                elif k == 'sb': # stratigraphic bounds: (N, [(points, name, rel), ...])
+                    o = (attr[0], [])
+                    for pts, name, rel in attr[1]:
+                        if not isinstance(pts, torch.Tensor):
+                            pts = _tensor(pts, dev=curlew.device, dt=curlew.dtype)
+                        o[1].append((pts, name, rel))
+                    attr = o
                 elif k == 'eq': # equalities are also special (keep as a list of tensors as shape will differ)
-                    attr = [ _tensor( t ) for t in attr ]            
+                    attr = [ _tensor( t ) for t in attr ]
                 else:
                     if attr is not None:
                         if isinstance( attr, (np.ndarray, list, tuple) ): # convert array-like types to tensor
@@ -237,9 +249,16 @@ class CSet:
                         if isinstance(p2, torch.Tensor):
                             p2 = _numpy(p2)
                         o[1].append((np.asarray(p1), np.asarray(p2), rel))
-                    attr = o   
+                    attr = o
+                elif k == 'sb': # stratigraphic bounds: (N, [(points, name, rel), ...])
+                    o = (attr[0], [])
+                    for pts, name, rel in attr[1]:
+                        if isinstance(pts, torch.Tensor):
+                            pts = _numpy(pts)
+                        o[1].append((np.asarray(pts), name, rel))
+                    attr = o
                 elif k == 'eq': # equalities are also special (list of arrays as shape differs)
-                    attr = [ _numpy( t ) for t in attr ]    
+                    attr = [ _numpy( t ) for t in attr ]
                 else:
                     if attr is not None:
                         if isinstance(attr, torch.Tensor ):
@@ -329,6 +348,8 @@ class CSet:
                 out.iq[1][i] = ( f(out.iq[1][i][0]), # LHS
                                  f(out.iq[1][i][1]), # RHS
                                  out.iq[1][i][2] ) # relation
+        if out.sb is not None:
+            out.sb = (out.sb[0], [(f(pts), name, rel) for (pts, name, rel) in out.sb[1]])
         if out.eq is not None:
             out.eq = [f(t) for t in out.eq]
         
@@ -474,6 +495,12 @@ class HSet:
             Factor applied to scale the loss resulting from any provided inequality constraints.
         eq_loss : float | str
             Factor applied to scale the loss resulting from equality (trace) constraints in ``CSet.eq``.
+        sb_loss : float | str
+            Factor applied to the stratigraphic-bound loss from ``CSet.sb`` (points above/below a named
+            learnable iso-value, residual normalised by ``‖∇f‖``; GeoINR-style). Default 0 (disabled).
+        overturn_loss : float | str
+            Factor applied to the no-overturn regularizer (penalises the field decreasing in the younging
+            direction; sampled on ``CSet.grid``). Default 0 (disabled).
         use_dynamic_loss_weighting : bool
             Enables dynamic task loss weighting based on real-time loss values. Default is False.
             This approach ensures that each task contributes equally in magnitude (≈1)
@@ -496,6 +523,8 @@ class HSet:
     prop_loss : float = 0 # "1.0"
     iq_loss : float = 0
     eq_loss : float = 0
+    sb_loss : float = 0
+    overturn_loss : float = 0
     use_dynamic_loss_weighting : bool = False
     one_hot : bool = False
     reuse_worst_half : float = 0.5

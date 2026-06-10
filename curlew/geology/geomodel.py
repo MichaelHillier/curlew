@@ -312,8 +312,9 @@ class GeoModel( LearnableBase ):
             self.llookup[F.name] = n # potential lithology created by this event (e.g., constant fields)
             n = n + 1
             if F.overprint is not None:  # only relevant for generative (overprinting) events [ as these "create" new rocks ]
+                iso_litho = getattr(F, "iso_litho", {})
                 for k in F.isosurfaces.keys():
-                    k = f"{F.name}_{k}" # build key using field name and lithology name
+                    k = f"{F.name}_{iso_litho.get(k, k)}" # key uses the iso's lithology label (band above it; defaults to the iso name)
                     assert k not in self.llookup, f"All isosurfaces in model must have unique names, but {k} is not unique!"
                     self.llookup[k] = n # assign ID for this lithology
                     n = n + 1 # increment ID

@@ -186,6 +186,15 @@ class NapariViewer:
         Viewer window title.
     ndisplay : int, optional
         ``2`` or ``3`` (default). Use ``2`` for planar models and ``matplotlib``-style sections.
+    vertical_exaggeration : float, optional
+        Display-only multiplier applied to the vertical (Curlew ``z`` / napari axis 0) of
+        **every** layer added to this viewer (3D only). Use it when the model's ``z`` extent
+        is tiny next to ``x``/``y`` (e.g. a basin) so features are not squashed onto one
+        plane. Because the same factor is baked into every layer's transform (point/mesh
+        ``z`` coordinates and image affines alike) the layers stay registered with one
+        another; only the absolute ``z`` world coordinates shown by the ruler/scale-bar are
+        stretched. Default ``1.0`` (no exaggeration). Set at construction (applied as layers
+        are added).
     **viewer_kwds
         Extra keyword arguments passed to `napari.Viewer()`.
     """
@@ -195,6 +204,7 @@ class NapariViewer:
         title: str = "curlew",
         *,
         ndisplay: int = None,
+        vertical_exaggeration: float = 1.0,
         viewer=None,
         **viewer_kwds,
     ):
@@ -230,6 +240,7 @@ class NapariViewer:
 
         self.viewer = viewer if viewer is not None else napari.Viewer(title=title, **viewer_kwds)
         self._ndisplay = int(ndisplay)
+        self._ve = float(vertical_exaggeration)  # display-only vertical exaggeration (3D, napari axis 0)
         self.viewer.dims.ndisplay = self._ndisplay
 
         # Ensure the active viewer matches the requested orientation, independent of
@@ -396,6 +407,9 @@ class NapariViewer:
     def _to_napari_xyz(self, arr) -> np.ndarray:
         """
         Curlew positions or directions ``(x, y)`` / ``(x, y, z)`` → napari **(z, y, x)**.
+
+        Applies the viewer's :attr:`vertical_exaggeration` to the z (napari axis 0) for 3D
+        viewers, so points/vectors stay registered with exaggerated meshes and volumes.
         """
         a = np.asarray(arr, dtype=np.float64)
         if a.size == 0:
@@ -405,12 +419,39 @@ class NapariViewer:
         if a.shape[1] == 2:
             # Pad to (z, y, x) with z=0 for 2D inputs.
             # n.b. napari defaults to y-axis-down, we want y-axis-up.
-            return np.column_stack([np.zeros(a.shape[0]), a[:, 1], a[:, 0]])
-        if a.shape[1] == 3:
-            return np.column_stack([a[:, 2], a[:, 1], a[:, 0]])
-        raise ValueError(
-            f"Expected 2 or 3 columns (Curlew x,y or x,y,z); got shape {a.shape}"
-        )
+            out = np.column_stack([np.zeros(a.shape[0]), a[:, 1], a[:, 0]])
+        elif a.shape[1] == 3:
+            out = np.column_stack([a[:, 2], a[:, 1], a[:, 0]])
+        else:
+            raise ValueError(
+                f"Expected 2 or 3 columns (Curlew x,y or x,y,z); got shape {a.shape}"
+            )
+        if self._ndisplay == 3 and self._ve != 1.0:
+            out[:, 0] *= self._ve
+        return out
+
+    def _apply_ve_volume(self, opts: dict, ndim: int) -> None:
+        """
+        Bake the viewer's vertical exaggeration into an :meth:`addVolume` ``opts`` dict
+        in place (3D volumes only). Stretches the world z (napari axis 0): for the affine
+        path this left-multiplies by ``diag(ve, 1, 1, 1)`` (scaling the affine's first row),
+        otherwise it scales the layer ``scale``/``translate`` first component.
+        """
+        if self._ndisplay != 3 or self._ve == 1.0 or ndim != 3:
+            return
+        ve = self._ve
+        if opts.get("affine") is not None:
+            A = np.array(opts["affine"], dtype=np.float64)
+            A[0, :] *= ve  # diag(ve,1,1,1) @ A — scale world-z output row
+            opts["affine"] = A
+        elif opts.get("scale") is not None:
+            s = np.array(opts["scale"], dtype=np.float64); s[0] *= ve
+            opts["scale"] = s
+            if opts.get("translate") is not None:
+                t = np.array(opts["translate"], dtype=np.float64); t[0] *= ve
+                opts["translate"] = t
+        else:
+            opts["scale"] = (ve, 1.0, 1.0)
 
     def addMesh(
         self,
@@ -454,6 +495,8 @@ class NapariViewer:
             raise ValueError("verts must have shape (N, 3)")
         if curlew_coords:
             verts = np.column_stack([verts[:, 2], verts[:, 1], verts[:, 0]])
+            if self._ndisplay == 3 and self._ve != 1.0:
+                verts[:, 0] *= self._ve  # exaggerate vertical (napari axis 0)
 
         if normals is not None:
             normals = np.asarray(normals, dtype=np.float64)
@@ -716,6 +759,9 @@ class NapariViewer:
         if affine_use is not None:
             opts["affine"] = affine_use
         opts.update(kwargs)
+
+        # apply display-only vertical exaggeration (3D volumes) to the layer transform
+        self._apply_ve_volume(opts, volume.ndim)
 
         # vispy uploads volumes to a GPU texture: hand it a C-contiguous float32
         # array. The (2,1,0) transpose above yields a non-contiguous, reversed-stride
