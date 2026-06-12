@@ -1,6 +1,15 @@
 # GeoINR inclusion — refactor handoff
 
-**Status:** the GeoINR stratigraphic machinery currently works but is **too invasive** to curlew
+**Status: EXECUTED (2026-06-10).** The checklist below was completed: core reverted to the
+pre-checkpoint state (`git checkout 01170cd` for the four files — all `sb`/learnable-iso
+machinery removed), the GeoINR losses now live in `_GeoINRLossMixin` (`curlew/fields/geoinr.py`,
+constructor kwargs `iq_norm_weight`/`overturn_weight`), the unit-only builder uses `CSet.iq` +
+post-hoc `estimate_isosurfaces(M)` (`curlew/geology/stratbuilder.py`), and the wcsb notebook was
+regenerated. Full test suite passes; a CPU smoke run (cap 150, 15 epochs) verified build → fit →
+estimate → predict end-to-end. Kept for the findings below; the deferred soft-unit/NLL milestone
+still stands.
+
+**Original plan:** the GeoINR stratigraphic machinery currently works but is **too invasive** to curlew
 core. This note is the plan to re-do it **minimally**, isolating GeoINR to `geoinr.py` +
 `stratbuilder.py`. Written for a cold-start session — read this + the memory
 `wcsb-geoinr-loss-port`, then execute the checklist. Reference: `SPEC.md` (§8.1 Findings).
@@ -100,3 +109,4 @@ than this session — revert the whole `sb`/learnable-iso mechanism, not just my
 - Overturn weight ~30 was a reasonable balance with the magnitude term at `scale=1`; re-tune after.
 - Deferred milestone (separate, larger): **soft-unit / NLL coupling across scalar fields** — the
   path to GeoINR_Research2-level results.
+7

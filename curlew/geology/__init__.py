@@ -423,4 +423,4 @@ def domainBoundary( name, *, C, bound = 0, gt = 0, lt = 1, mode="below",
     return f
 
 # strat-column → GeoModel builder (imported last so `strati` etc. are defined)
-from curlew.geology.stratbuilder import build_geomodel
+from curlew.geology.stratbuilder import build_geomodel, estimate_isosurfaces

@@ -245,6 +245,124 @@ def loadPLY(path):
     return out
 
 
+def saveVTK(path, geode, fields=False, properties=True, extra=None):
+    """
+    Export a grid-based :class:`~curlew.core.Geode` (e.g. from
+    ``GeoModel.predict(grid)``) to a VTK volume for inspection in ParaView.
+
+    The output format follows the file extension:
+
+    - ``.vts`` — `StructuredGrid`; works for any :class:`~curlew.geometry.Grid`
+      (including rotated ones), as the full point coordinates are written.
+    - ``.vti`` — `ImageData`; smaller/faster, but only valid for axis-aligned
+      grids (raises if the grid has a rotation).
+
+    Point data written: ``scalar``, ``lithoID`` and ``structureID`` (as int32, so
+    ParaView can colour/threshold by unit), plus ``properties`` (named columns,
+    when present and ``properties=True``) and each per-event scalar field from
+    ``geode.fields`` (when ``fields=True``). The integer→name legends
+    (``geode.lithoLookup`` / ``structureLookup``) are embedded as field-data
+    string arrays (``lithoID_legend`` / ``structureID_legend``, one ``"<id>: <name>"``
+    entry each) — visible in ParaView's Information panel / spreadsheet view — so
+    every lithoID can be identified by name.
+
+    Requires ``pyvista`` (lazily imported, optional dependency).
+
+    Parameters
+    ----------
+    path : str | os.PathLike
+        Output file path ending in ``.vts`` or ``.vti``.
+    geode : curlew.core.Geode
+        Model output evaluated on a grid (``geode.grid`` must be set).
+    fields : bool
+        Also write each per-event scalar field in ``geode.fields``. Default False.
+    properties : bool
+        Write ``geode.properties`` columns (named by ``geode.propertyNames``)
+        when present. Default True.
+    extra : dict, optional
+        Additional named point-data arrays to write, each flat ``(N,)`` in the
+        grid's evaluation order (e.g. a stratigraphic ``level`` volume derived
+        from ``lithoID``). Keys become the array names in the file.
+
+    Returns
+    -------
+    pyvista.DataSet
+        The saved mesh (so it can be inspected/plotted directly).
+    """
+    try:
+        import pyvista as pv
+    except ImportError as exc:  # keep pyvista optional per repo convention
+        raise ImportError(
+            "saveVTK requires pyvista. "
+            "Install with `conda install -c conda-forge pyvista` (or `pip install pyvista`)."
+        ) from exc
+
+    G = geode.grid
+    assert G is not None, "saveVTK requires a Geode evaluated on a grid (geode.grid is None)."
+    path = Path(path)
+    assert path.suffix.lower() in (".vts", ".vti"), \
+        f"saveVTK writes .vts or .vti files, got '{path.suffix}'."
+
+    shape = tuple(G.shape)
+    ndim = len(shape)
+    assert ndim in (2, 3), f"saveVTK supports 2D/3D grids, got {ndim}D."
+
+    # curlew flattens grids in C-order (LAST axis fastest); VTK expects the FIRST
+    # (x) axis fastest. Reorder every array to VTK order so axes keep their meaning.
+    axorder = tuple(range(ndim))[::-1]
+
+    def _vtk_order(a):
+        a = np.asarray(a.detach().cpu() if hasattr(a, "detach") else a)
+        return np.ascontiguousarray(a.reshape(shape).transpose(axorder)).ravel()
+
+    if path.suffix.lower() == ".vti":
+        R = G.matrix[:ndim, :ndim]
+        assert np.allclose(R, np.diag(np.diag(R))), \
+            "ImageData (.vti) requires an axis-aligned grid; use .vts for rotated grids."
+        origin = [float(G.axes[i][0] + G.center[i]) for i in range(ndim)]
+        spacing = [float(G.step[i]) for i in range(ndim)]
+        if ndim == 2:  # pad to 3D (single z slice)
+            origin, spacing = origin + [0.0], spacing + [1.0]
+        mesh = pv.ImageData(dimensions=tuple(shape) + (1,) * (3 - ndim),
+                            origin=origin, spacing=spacing)
+    else:
+        pts = np.asarray(G.coords(), float)
+        if ndim == 2:
+            pts = np.hstack([pts, np.zeros((len(pts), 1))])
+        pts = pts.reshape(shape + (pts.shape[-1],)).transpose(axorder + (ndim,)).reshape(-1, 3)
+        mesh = pv.StructuredGrid()
+        mesh.points = pts
+        mesh.dimensions = tuple(shape) + (1,) * (3 - ndim)
+
+    # point data (+ embedded id -> name legends as field data)
+    if geode.scalar is not None:
+        mesh.point_data["scalar"] = _vtk_order(geode.scalar)
+    for name, ids, lookup in (("lithoID", geode.lithoID, geode.lithoLookup),
+                              ("structureID", geode.structureID, geode.structureLookup)):
+        if ids is None:
+            continue
+        mesh.point_data[name] = _vtk_order(ids).astype(np.int32)
+        if lookup:
+            mesh.field_data[f"{name}_legend"] = np.array(
+                [f"{i}: {n}" for i, n in sorted(lookup.items())])
+    if properties and (geode.properties is not None):
+        props = np.asarray(geode.properties)
+        names = geode.propertyNames or [f"property{i}" for i in range(props.shape[-1])]
+        for i, n in enumerate(names):
+            mesh.point_data[n] = _vtk_order(props[..., i] if props.ndim > 1 else props)
+    if fields:
+        for name, vals in geode.fields.items():
+            mesh.point_data[f"field_{name}"] = _vtk_order(vals)
+    if extra:
+        for name, vals in extra.items():
+            mesh.point_data[name] = _vtk_order(vals)
+
+    if path.parent and str(path.parent) not in ("", "."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    mesh.save(str(path))
+    return mesh
+
+
 # ---------------------------------------------------------------------------
 # Observation loading (point observations for the strat-column builder)
 # ---------------------------------------------------------------------------

@@ -11,12 +11,20 @@ GeoINR's per-field recipe into Curlew:
 
   * one neural field per event (Siren or softplus-MLP), assembled by Curlew's
     native predict/combine (oldest→youngest onlap/truncation chain);
-  * every surface is a **learnable iso-value** constrained by the units above and
-    below it via the gradient-normalised stratigraphic-bound loss (`CSet.sb`,
-    `HSet.sb_loss`), residual = (f - iso)/‖∇f‖ — which prevents field collapse;
-  * a **no-overturn** regularizer (`HSet.overturn_loss`) keeps each field monotone
-    in the younging direction so the unconformity surfaces nest;
-  * `cap_per_unit` subsampling keeps rare units represented (SPEC §4.4).
+  * each field is constrained purely by **point-vs-point inequalities** (`CSet.iq`:
+    younger unit points above older ones), consumed by the GeoINR-side
+    gradient-normalised inequality loss, residual = (f(P1) - f(P2))/‖∇f(P1)‖ —
+    which prevents field collapse;
+  * a **no-overturn** regularizer keeps each field monotone in the younging
+    direction so the unconformity surfaces nest;
+  * surfaces are **estimated post-fit** (`estimate_isosurfaces`: midpoint of the
+    adjacent units' median field values) and set as ordinary fixed iso-values;
+  * the region-only events (basement / top unit) carry loss-free **aliases** of the
+    adjacent unconformity's field (GeoINR's basement treatment), so the deep scalar
+    is structured rather than an untrained network;
+  * `cap_per_unit` subsampling keeps rare units represented (SPEC §4.4); the per-epoch
+    constraint budget matches GeoINR (`IQ_SAMPLES`~1024 ≈ full pools, 5000
+    regularization samples).
 
 The notebook is built for **inspection**: it renders the per-field constraints and
 the per-field scalar fields (so each field can be judged on its own) as well as the
@@ -38,13 +46,15 @@ Sedimentary Basin column (36 units, conformal/baselap/eroded) observed as **unit
 points only** (`cleaner_markers.vtp`). `build_geomodel` produces an **alternating
 chain** of erosional unconformities and depositional packages with synthesized
 region-only events at both ends (Precambrian basement at the bottom; the dropped
-top baselap unit at the top), each a neural field with a **learnable iso-value**.
+top baselap unit at the top), each a neural field constrained by unit ordering.
 
-**Loss (GeoINR's per-field `pairwise=False` recipe):** for every surface, the units
-**above** it must have `f > iso` and the units **below** must have `f < iso`, with the
-residual normalised by `‖∇f‖` (`CSet.sb` / `HSet.sb_loss`) so the scale-free field
-cannot collapse; a **no-overturn** term (`HSet.overturn_loss`) keeps the field monotone
-upward. The learnable iso is the `Overprint` threshold and the extraction iso.
+**Loss (GeoINR's per-field `pairwise=False` recipe, on the field classes):** younger
+unit points must sit above older unit points (`CSet.iq`), with the residual
+`(f(P1) - f(P2))/‖∇f(P1)‖` normalised by the gradient so the scale-free field cannot
+collapse; a **no-overturn** term keeps the field monotone upward. Surfaces are not
+learned: after fitting, `estimate_isosurfaces` places each contact/unconformity at the
+separation value between the adjacent units' field-value distributions (midpoint of
+medians) — that value is the `Overprint` threshold and the extraction iso.
 
 This notebook is built for **inspection**: it renders the per-field constraints and
 per-field scalar fields (each field judged on its own), the combined model, and
@@ -61,7 +71,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import curlew
 from curlew.io import loadObservations
-from curlew.geology.stratbuilder import build_geomodel
+from curlew.geology.stratbuilder import build_geomodel, estimate_isosurfaces
 
 DEVICE = os.environ.get("CURLEW_DEVICE", "cuda")
 if DEVICE.startswith("cuda") and not torch.cuda.is_available():
@@ -86,8 +96,18 @@ if FIELD == "Siren":
 else:  # softplus MLP — beta in ~[20, 50]
     FIELD_KWARGS = dict(activation=nn.Softplus(beta=40), learning_rate=1e-3, hidden_dim=256)
 CAP_PER_UNIT = 1500     # cap per unit at load (imbalance-aware, SPEC §4.4)
-SB_SAMPLES   = 128      # points drawn per constraint pool each step
-N_EPOCHS     = 1500     # ~1500 for review; 3000 (GeoINR's count) for the best fit
+IQ_SAMPLES   = 1024     # points drawn per inequality pool each step (~full pool at the cap;
+                        # GeoINR uses ALL constraint points per epoch — max_points=0)
+N_EPOCHS     = 3000     # GeoINR's count; per-field accuracy plateaus around here
+
+# per-field GeoINR loss weights (consumed by the field classes, not HSet).
+# NB: GeoINR's original overturn weight (1) does NOT transfer to curlew's sequential
+# combine: measured here, weight 1 gives 66.5% of columns an older-above-younger
+# inversion (basement leaks through non-monotone deep fields) vs 0.1% at weight 30,
+# for only +0.014 band accuracy. Lower it only if you also change the combine.
+IQ_WEIGHT       = 1.0   # gradient-normalised inequality (GeoINR's unit weight)
+OVERTURN_WEIGHT = 30.0  # no-overturn magnitude
+FIELD_KWARGS.update(iq_norm_weight=IQ_WEIGHT, overturn_weight=OVERTURN_WEIGHT)
 print("device:", curlew.device, "| field:", FIELD, "| data:", DATA)""")
 
 # ---------------------------------------------------------------- 1. load
@@ -102,7 +122,7 @@ print("observations:", len(obs), "unit points |", obs.ndim, "D |",
       f"{len(obs.levels('unit'))} levels {obs.levels('unit')[0]}..{obs.levels('unit')[-1]}")
 
 M = build_geomodel(STRAT_CSV, obs, field=FIELD, scale="geo_extensive",
-                   cap_per_unit=CAP_PER_UNIT, iq_samples=SB_SAMPLES, seed=0,
+                   cap_per_unit=CAP_PER_UNIT, iq_samples=IQ_SAMPLES, seed=0,
                    field_kwargs=FIELD_KWARGS)
 T = M.normalization""")
 code(r"""try:
@@ -125,14 +145,17 @@ md(r"""## 2. Scalar-field partitioning (visual)
 The builder reverses the partitioner to oldest→youngest and emits an alternating
 chain: a region-only **basement**, then for each unconformity an **erosional** event
 (`mode='above'`) followed by the **depositional** package that **onlaps** it, capped by
-a region-only event for the dropped top unit. Each colour is one event; erosional
+a region-only event for the dropped top unit. The two region-only events carry no
+constraints of their own — their fields are **aliases** of the adjacent unconformity's
+field (basement = the Precambrian Unconformity field continued below its iso; top unit =
+the youngest unconformity's field above its iso). Each colour is one event; erosional
 events own no lithology (they are surfaces covered by the onlapping package).""")
 code(r"""print("derived events (oldest → youngest):")
 for ev, meta in zip(M.events, M.field_meta):
-    extra = (f"iso between L{meta.iso_above_level}/L{meta.iso_below_level}"
+    extra = (f"iso between L{min(meta.above_levels)}..{max(meta.above_levels)} / L{meta.eroded_level}"
              if meta.is_unconformity else (f"levels={meta.levels}" if meta.levels else ""))
     print(f"  eid={ev.eid:2d}  {meta.kind:11s}  onlap={ev.overprint.defaultDomain:6s}  "
-          f"n_sb={meta.n_iq:2d}  isos={len(ev.getIsovalues()):d}  {meta.name[:34]:34s}  {extra}")
+          f"n_iq={meta.n_iq:2d}  {meta.name[:34]:34s}  {extra}")
 
 units = M.strat_units; n = len(units)
 ev_of_level = {L: k for k, meta in enumerate(M.field_meta) for L in meta.levels}
@@ -150,37 +173,51 @@ code(r"""M""")
 # ---------------------------------------------------------------- 3. constraints
 md(r"""## 3. Constraint relations (per field)
 
-There are **no** `eq` traces or `gv` normals. Each field is driven by `sb` bounds
-relative to its learnable iso-value(s): a unit is `>` (above) or `<` (below) a named
-iso. Note these are **point-vs-iso**, not point-vs-point — but they encode the same
-ordering: for an unconformity, `above_levels > iso > below_levels` means every above
-level sits above every below level. The cell lists, **per field**, each iso and the
-levels constrained above/below it (the bespoke SPEC §4.2 rule), plus the
-**initial** iso-values (pre-fit).""")
-code(r"""# exact per-field constraints recorded at build time (meta.sb_relations: list of
-# (level, iso_name, '>'|'<')). Each says "points of <level> sit above/below <iso>".
-print("per-field sb constraints  (levels '>' iso  >  levels '<' iso) :")
+There are **no** `eq` traces or `gv` normals — each field is driven purely by
+**point-vs-point inequalities** (`CSet.iq`): for a depositional package, each band's
+points sit above the band directly below; for an unconformity, every level of the
+onlapping (adjacent-younger) package sits above the eroded unit **and every older
+level** (the explicit "everything older" side is what keeps the deep unconstrained
+region — the basement — below the surface; the no-overturn term alone is too weak
+there). The cell lists, **per field**, the exact level orderings recorded at build
+time. No iso-values exist yet — they are estimated after fitting (§4).""")
+code(r"""# exact per-field constraints recorded at build time (meta.iq_relations: list of
+# (above, below_level, '>') where `above` is one level, or a tuple of levels for the
+# pooled above side of an unconformity). Each says "<above> points sit above <below> points".
+def lab(a):  # an above side is a single level or a pooled tuple of levels
+    return "+".join(f"L{x}" for x in a) if isinstance(a, tuple) else f"L{a}"
+print("per-field iq constraints  (above  >  below) :")
 for ev, meta in zip(M.events, M.field_meta):
-    if not meta.sb_relations:
-        print(f"  {meta.name[:34]:34s} [{meta.kind}] : (no sb constraints)")
+    if not meta.iq_relations:
+        print(f"  {meta.name[:34]:34s} [{meta.kind}] : (no constraints)")
         continue
-    by_iso = {}   # iso_name -> {'>':[levels], '<':[levels]}
-    for level, name, rel in meta.sb_relations:
-        by_iso.setdefault(name, {">": [], "<": []})[rel].append(level)
-    print(f"  {meta.name[:34]:34s} [{meta.kind}]")
-    for name, d in by_iso.items():
-        above = ",".join(f"L{l}" for l in sorted(d[">"]))
-        below = ",".join(f"L{l}" for l in sorted(d["<"], reverse=True))
-        print(f"      iso '{name[:24]}' (init={ev.getIsovalue(name):+.3f}):  {above}  >  iso  >  {below}")""")
+    by_above = {}   # above (level or tuple) -> [below_levels]
+    for a, b, _ in meta.iq_relations:
+        by_above.setdefault(a, []).append(b)
+    print(f"  {meta.name[:34]:34s} [{meta.kind}]  ({meta.n_iq} pairs)")
+    for a in by_above:
+        bs = sorted(by_above[a])
+        rng_s = f"L{bs[0]}..L{bs[-1]}" if len(bs) > 2 else ",".join(f"L{b}" for b in bs)
+        print(f"      {lab(a)}  >  {rng_s}")""")
 
 # ---------------------------------------------------------------- 4. fit
-md(r"""## 4. Fit
+md(r"""## 4. Fit & post-hoc surface estimation
 
 `M.fit(history=True)` trains all fields jointly and returns a per-epoch loss
-breakdown. Below the loss curve we confirm **every unit** appears in ≥1 `sb` pool
-(so it is resampled — `SB_SAMPLES` points — every step; SPEC §4.4).""")
+breakdown. The unit-only path learns **no** surfaces during the fit — afterwards,
+`estimate_isosurfaces(M)` places each contact/unconformity at the **midpoint of the
+median field values** of the two unit populations it separates and sets it as an
+ordinary fixed iso (this must run before `M.predict`). Below the loss curve we
+confirm **every unit** appears in ≥1 inequality (so it is resampled — `IQ_SAMPLES`
+points — every step; SPEC §4.4); the constraints come straight from
+`meta.iq_relations`, so the count is exact.""")
 code(r"""loss, pebble, history = M.fit(N_EPOCHS, early_stop=None, best=False, history=True)
 print("final loss:", loss); print(pebble)
+
+isos = estimate_isosurfaces(M)     # REQUIRED on the unit-only path (before any predict)
+print(f"\nestimated {len(isos)} surface iso-values (midpoint-of-medians):")
+for k, v in isos.items():
+    print(f"  {k[:48]:48s} {v:+.3f}")
 
 losses = [p.total() for p in history]
 fig, ax = plt.subplots(1, 2, figsize=(12, 3.4))
@@ -188,22 +225,17 @@ ax[0].plot(np.arange(1, len(losses) + 1), losses, lw=1); ax[0].set_yscale("log")
 ax[0].set_xlabel("epoch"); ax[0].set_ylabel("total loss (log)"); ax[0].grid(True, alpha=0.3)
 ax[0].set_title(f"wcsb training loss ({FIELD})")
 
-# per-unit representation: # sb pools each level appears in
+# per-unit representation: # inequality pairs each level appears in (either side;
+# an erosional pair's above side is a pooled tuple of levels)
 rep = {L: 0 for L in obs.levels("unit")}
-Xm_all = T.apply(obs.coords.astype(float))
-refc = {L: Xm_all[(~obs.is_interface) & (obs.level == L)].mean(0) for L in obs.levels("unit")
-        if ((~obs.is_interface) & (obs.level == L)).any()}
-def which_level(arr):
-    c = np.asarray(arr.detach().cpu() if hasattr(arr, "detach") else arr, float).mean(0)
-    return min(refc, key=lambda L: np.linalg.norm(refc[L] - c))
-for ev in M.events:
-    C = ev.field.C
-    if C is None or C.sb is None: continue
-    for L in {which_level(p) for p, _, _ in C.sb[1]}:
-        rep[L] += 1
+for meta in M.field_meta:
+    for a, b, _ in meta.iq_relations:
+        for x in (a if isinstance(a, tuple) else (a,)):
+            rep[x] += 1
+        rep[b] += 1
 levels_sorted = sorted(rep)
 ax[1].bar([str(L) for L in levels_sorted], [rep[L] for L in levels_sorted])
-ax[1].set_xlabel("unit level"); ax[1].set_ylabel("# sb pools"); ax[1].tick_params(axis="x", labelrotation=90, labelsize=6)
+ax[1].set_xlabel("unit level"); ax[1].set_ylabel("# iq pairs"); ax[1].tick_params(axis="x", labelrotation=90, labelsize=6)
 ax[1].set_title(f"per-unit representation (min={min(rep.values())})")
 plt.tight_layout(); plt.show()""")
 
@@ -211,9 +243,11 @@ plt.tight_layout(); plt.show()""")
 md(r"""## 5. Per-field scalar fields (inspection)
 
 Each event's field, evaluated **on its own** (`combine=False`) on a vertical section,
-with its learnable iso-surface(s) contoured. This shows whether each field is
+with its estimated iso-surface(s) contoured. This shows whether each field is
 *individually* geologically reasonable (monotone, surface at the right level) —
-independently of how the sequential combine assembles them.""")
+independently of how the sequential combine assembles them. (Note: a "turn-up" at the
+west edge is extrapolation beyond the data plus the real westward basin-margin rise,
+not a fitting bug.)""")
 code(r"""lo, hi = obs.bounds(); lo = np.asarray(lo, float); hi = np.asarray(hi, float)
 center = 0.5 * (lo + hi)
 nx, nz = 200, 130
@@ -236,7 +270,7 @@ for ax, ev in zip(axes, sel):
         ax.contour(xs, zs, S, levels=isov, colors="k", linewidths=1.0)
     ax.set_title(ev.name[:30], fontsize=8); ax.set_xlabel("x"); ax.set_ylabel("z")
 for ax in axes[len(sel):]: ax.axis("off")
-fig.suptitle(f"per-field scalar fields ({FIELD}) — black = learnable iso-surfaces")
+fig.suptitle(f"per-field scalar fields ({FIELD}) — black = estimated iso-surfaces")
 plt.tight_layout(); plt.show()""")
 
 # ---------------------------------------------------------------- 6. combined / 3D
@@ -300,7 +334,7 @@ if SHOW_NAPARI:
     nv.addPoints("observations (true unit)", Pworld, rgb=pt_rgba,
                  size=3 * RES_XY, border_color="black")
 
-    # per-event learnable iso-surfaces
+    # per-event estimated iso-surfaces
     nC = sum(len(e.isosurfaces) for e in M.events) or 1; j = 0
     for e in M.events:
         if not e.isosurfaces: continue
@@ -316,22 +350,51 @@ if SHOW_NAPARI:
             j += 1
     nv.show()
     print("napari: lithology + structure volumes + observation points + per-event iso-surfaces")""")
+md(r"""### Export for ParaView
+
+Write the predicted volume to a VTK file for detailed inspection (`curlew.io.saveVTK`;
+`.vti` since the grid is axis-aligned — use `.vts` for rotated grids). Two unit arrays
+are written:
+
+- **`level`** — the predicted unit's stratigraphic level, *the same convention as the
+  observation data* (ascending = older; basement = max level; `-1` where the predicted
+  lithology is not a unit). This is the array to colour by / compare against the data.
+- **`lithoID`** — curlew's internal lithology id (ascending = younger; ids are assigned
+  oldest→youngest with gaps for surface-only events). The id→name legend is embedded as
+  the `lithoID_legend` field-data array (Spreadsheet view → Field Data) and printed below.
+
+Note the napari colormap (`curlew.ccstrat`) is a deliberately *shuffled* ramp (so thin
+adjacent bands stay distinguishable) — apparent out-of-sequence colours in napari are
+not evidence of out-of-sequence units; check `level` here instead.""")
+code(r"""from curlew.io import saveVTK
+VTK_PATH = "wcsb_prediction.vti"
+
+# stratigraphic level per voxel (the data's own convention: ascending = older)
+lut = np.full(max(M.llookup.values()) + 1, -1, dtype=np.int32)
+for L, key in M.level_litho.items():
+    lut[M.llookup[key]] = L
+saveVTK(VTK_PATH, geode, extra={"level": lut[geode.lithoID]})
+print("wrote", VTK_PATH, f"({np.prod(G.shape):,} cells)")
+print("\nlithoID legend (id -> unit / band):")
+for i, n in sorted(geode.lithoLookup.items()):
+    print(f"  {i:3d}  {n}")""")
 
 # ---------------------------------------------------------------- 7. checks
 md(r"""## 7. Checks & diagnostics (SPEC §6.2)
 
-The **machinery** checks (event chain, per-unit representation, above/below
-constraint satisfaction, iso placement, monotonic isos) verify the SPEC §4.2/§4.4/§8.1
-work and are asserted. The **per-point label accuracy** (lithology band / structure /
-basement) is *reported* per level for inspection — with this per-field model + the
-sequential combine it is bounded (key points near unconformities are mislabelled, as
-expected for the non-coupled recipe); the soft-unit/NLL coupling is the path to higher
-per-point accuracy.""")
+The **structural** checks (event chain, per-unit representation) verify the
+SPEC §4.2/§4.4/§8.1 builder work and are asserted. The **fit-quality** diagnostics
+(inequality satisfaction, iso placement, per-package iso ordering) and the
+**per-point label accuracy** (lithology band / structure / basement) are *reported*
+for inspection — with this per-field model + the sequential combine the accuracy is
+bounded (key points near unconformities are mislabelled, as expected for the
+non-coupled recipe); the soft-unit/NLL coupling is the path to higher per-point
+accuracy.""")
 code(r"""metas = M.field_meta
 def fvals(ev, pts):
     with torch.no_grad():
-        return ev.forward(torch.tensor(pts, dtype=curlew.dtype, device=curlew.device)).detach().cpu().numpy().reshape(-1)
-refm = {L: T.apply(obs.coords[(~obs.is_interface) & (obs.level == L)][:400].astype(float)) for L in obs.levels("unit")}
+        return ev.forward(torch.tensor(np.asarray(pts, float), dtype=curlew.dtype,
+                                       device=curlew.device)).detach().cpu().numpy().reshape(-1)
 
 results = {}
 # 1. event chain
@@ -345,43 +408,51 @@ print(f"1. event chain: {len(metas)} events "
 
 # 2. every unit represented
 results["every_unit_represented"] = bool(min(rep.values()) > 0)
-print(f"2. every unit in >=1 sb pool: min={min(rep.values())} -> {results['every_unit_represented']}")
+print(f"2. every unit in >=1 iq pair: min={min(rep.values())} -> {results['every_unit_represented']}")
 
-# 3. above/below constraint satisfaction on unit points
+# 3. inequality satisfaction on unit points (fraction of cross-pairs correctly ordered)
+# Field values per (event, level) from the builder's capped model-coord pools.
 sat = []
-for ev in M.events:
-    C = ev.field.C
-    if C is None or C.sb is None: continue
-    iso = {n: ev.getIsovalue(n) for n in ev.field._iso_index}
-    for pts, name, rel in C.sb[1]:
-        v = fvals(ev, np.asarray(pts.detach().cpu() if hasattr(pts, "detach") else pts, float))
-        sat.append(np.mean(v > iso[name]) if rel == ">" else np.mean(v < iso[name]))
+for meta in metas:
+    if not meta.iq_relations: continue
+    ev = M[meta.name]
+    lv_set = set()
+    for a, b, _ in meta.iq_relations:
+        lv_set.update(a if isinstance(a, tuple) else (a,)); lv_set.add(b)
+    vals = {L: fvals(ev, M.level_points[L]) for L in lv_set}
+    for a, b, _ in meta.iq_relations:
+        va = np.concatenate([vals[x] for x in (a if isinstance(a, tuple) else (a,))])
+        sat.append(float(np.mean(va[:, None] > vals[b][None, :])))
 iq_sat = float(np.mean(sat))
 results["constraint_satisfaction"] = bool(iq_sat > 0.9)
-print(f"3. above/below satisfaction (mean over pools): {iq_sat:.3f} -> {results['constraint_satisfaction']}")
+print(f"3. inequality satisfaction (mean over pairs): {iq_sat:.3f} -> {results['constraint_satisfaction']}")
 
-# 4. iso between adjacent clouds
+# 4. estimated unconformity iso between the adjacent clouds (medians, matching the estimator)
 between = True
-for ev, meta in zip(M.events, metas):
+for meta in metas:
     if not meta.is_unconformity: continue
+    ev = M[meta.name]
     iso = ev.getIsovalue(meta.iso_name)
-    b = fvals(ev, refm[meta.iso_below_level]).mean(); a = fvals(ev, refm[meta.iso_above_level]).mean()
-    between &= (b < iso < a)
+    a = np.median(fvals(ev, np.concatenate([M.level_points[L] for L in meta.above_levels
+                                            if len(M.level_points.get(L, ())) > 0])))
+    b = np.median(fvals(ev, M.level_points[meta.eroded_level]))
+    between &= bool(b < iso < a)
 results["iso_between"] = bool(between)
 print(f"4. each unconformity iso between adjacent clouds -> {results['iso_between']}")
 
-# 5. monotonic isos per depositional field
+# 5. monotonic isos per depositional field (younger contact above older)
 mono = True
-for ev, meta in zip(M.events, metas):
+for meta in metas:
     if meta.kind != "depositional" or len(meta.contacts) < 2: continue
+    ev = M[meta.name]
     iv = np.array([ev.getIsovalue(c.name) for c in meta.contacts]); d = np.diff(iv)
-    mono &= bool(np.all(d < 0) or np.all(d > 0))
+    mono &= bool(np.all(d < 0))
 results["iso_monotonic"] = bool(mono)
 print(f"5. per-package iso monotonicity -> {results['iso_monotonic']}")
 
 print("\n" + "=" * 48)
 # assert only the structural builder invariants; report the fit-quality diagnostics
-# (satisfaction, iso ordering) — with the isos adapting freely (scale=1) these can vary.
+# (satisfaction, iso ordering) — these depend on the fit and the post-hoc estimates.
 STRUCTURAL = ("event_chain", "every_unit_represented")
 for k, v in results.items():
     print(f"  {('PASS' if v else ('FAIL' if k in STRUCTURAL else 'report')):6s} {k}")

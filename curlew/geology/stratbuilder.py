@@ -14,20 +14,25 @@ Two construction paths are supported, chosen automatically from the observations
 
 - **On-surface path** (e.g. ``multilayer_fold``) — when contact (interface) points
   exist, each depositional package is one ``strati`` event with ``eq`` traces, seed
-  isosurfaces and ``gv`` gradients (see :func:`_build_depositional_event`).
+  isosurfaces and ``gv`` gradients (see :func:`_build_depositional_event`). With
+  GeoINR-family fields the ``eq``/``iq`` constraints are consumed by GeoINR's
+  gradient-normalised interface/inequality losses, consistent with the unit-only path.
 - **Unit-only path** (e.g. ``wcsb``) — when only unit (level-labelled) points exist,
   the column is built as an alternating chain of **erosional** unconformities and
   **depositional** packages, with synthesized **region-only** events at both ends
   (the eroded basement at the bottom, the dropped top baselap unit at the top).
   Erosional events truncate older geology at their own iso (``mode='above'``);
   depositional / region-only packages **onlap** the unconformity directly below them
-  (``onlap=True``). Because no on-surface points exist, every surface is a **learnable
-  iso-value** (:meth:`~curlew.geology.geoevent.GeoEvent.addIsosurface` with
-  ``learnable=``) constrained by the units **above and below** it via the
-  gradient-normalised stratigraphic-bound loss (``CSet.sb`` / ``HSet.sb_loss``), with a
-  **no-overturn** regularizer (``HSet.overturn_loss``) keeping the field monotone in the
-  younging direction. This is GeoINR's per-field ``pairwise=False`` recipe; the learnable
-  iso serves as both the ``Overprint`` threshold and the extraction iso. ``cap_per_unit``
+  (``onlap=True``). Because no on-surface points exist, each field is constrained
+  purely by **point-vs-point inequalities** (``CSet.iq``: younger unit points ``>``
+  older unit points) consumed by the GeoINR gradient-normalised inequality loss
+  plus a **no-overturn** regularizer, both implemented on the field classes
+  themselves (see :class:`curlew.fields.geoinr.GeoINR` — the unit-only
+  path therefore requires ``GeoINR`` or ``Siren`` fields). Surfaces are **not**
+  learned: after ``M.fit``, call :func:`estimate_isosurfaces` to estimate each
+  contact/unconformity iso-value from the separation between the adjacent units'
+  field-value distributions and set it via the ordinary
+  :meth:`~curlew.geology.geoevent.GeoEvent.addIsosurface`. ``cap_per_unit``
   subsamples each unit so rare units stay represented (SPEC §4.4).
 """
 
@@ -43,6 +48,7 @@ from curlew.core import CSet, HSet
 from curlew.geology import strati
 from curlew.geology.geomodel import GeoModel
 from curlew.geometry import Transform, Grid
+from curlew.fields import BaseSF
 from curlew.fields.geoinr import GeoINR, Siren
 
 # field-name → class, used to resolve the ``field=`` argument
@@ -339,18 +345,24 @@ class _FieldMeta:
     inequalities: list = _dcfield(default_factory=list)  # list[(nameA, nameB, '>'|'<')] feature pairs
     # --- unit-only (wcsb) chain metadata ---
     is_unconformity: bool = False     # True for erosional events
-    levels: list = _dcfield(default_factory=list)        # unit levels owned by this event (lithology bands)
+    levels: list = _dcfield(default_factory=list)        # unit levels owned by this event (lithology bands, youngest-first)
     above_levels: list = _dcfield(default_factory=list)  # erosional: younger (above) unit levels
     below_levels: list = _dcfield(default_factory=list)  # erosional: older (below) unit levels
-    iso_name: str = None              # name of the seed isosurface (unconformity threshold)
+    eroded_level: int = None          # erosional: level of the eroded unit (directly below the iso)
+    iso_name: str = None              # name of the isosurface (unconformity threshold; set post-fit)
     level_litho: dict = _dcfield(default_factory=dict)   # level -> predicted lithology name
-    n_iq: int = 0                     # number of inequality pools on this event
-    sb_relations: list = _dcfield(default_factory=list)  # list[(level, iso_name, '>'|'<')] exact sb constraints
+    n_iq: int = 0                     # number of inequality pairs on this event
+    # exact iq constraints: list[(above, below_level, '>')] where ``above`` is a single
+    # level (depositional adjacent-band pairs) or a tuple of levels (erosional events
+    # pool the onlapping package's levels into one above-side pool)
+    iq_relations: list = _dcfield(default_factory=list)
 
 
 def _default_hset(has_normals: bool, has_iq: bool) -> HSet:
     """
-    A minimal HSet for a depositional field: only the active terms are non-zero.
+    A minimal HSet for a depositional field built from a **non-GeoINR** field type
+    (GeoINR-family fields use their own gradient-normalised losses instead — see
+    :func:`_build_depositional_event`). Only the active terms are non-zero.
 
     ``eq_loss`` is up-weighted because the trace loss is mean-normalised (``var/mu²``)
     and the field's absolute level is an unconstrained gauge, so a weight of 1 leaves
@@ -376,6 +388,12 @@ def _build_depositional_event(sf, units, obs, Xm, ndim, field_cls, field_kwargs,
     - one ``eq`` trace + one seed isosurface per contact,
     - ``gv`` gradient constraints from bedding normals (where present),
     - ``iq`` inequalities ordering younger contacts above older ones.
+
+    For GeoINR-family fields (and no explicit ``hset``) the ``eq``/``iq`` constraints
+    are consumed by GeoINR's **gradient-normalised** interface and inequality losses
+    (``eq_norm_weight`` / ``iq_norm_weight`` on the field — consistent with the
+    unit-only path) instead of the generic curlew terms; only the normal (gradient)
+    loss stays on the ``HSet``. Other field types keep :func:`_default_hset`.
     """
     # contacts in youngest→oldest order (smaller unit_index == younger)
     contact_indices = sorted(sf.horizon_unit_indices)
@@ -463,9 +481,19 @@ def _build_depositional_event(sf, units, obs, Xm, ndim, field_cls, field_kwargs,
     if iq_pairs:
         C.iq = (int(iq_samples), iq_pairs)
 
-    H = hset.copy() if hset is not None else _default_hset(gp is not None, bool(iq_pairs))
-
     fkw = dict(field_kwargs or {})
+    if hset is not None:
+        H = hset.copy()
+    elif isinstance(field_cls, type) and issubclass(field_cls, GeoINR):
+        # GeoINR-family: gradient-normalised interface/inequality losses on the field
+        # (consistent with the unit-only path); generic HSet keeps only the normal loss
+        H = HSet().zero()
+        if gp is not None:
+            H.grad_loss = 1.0
+        fkw.setdefault("eq_norm_weight", 1.0)
+        fkw.setdefault("iq_norm_weight", 1.0)
+    else:
+        H = _default_hset(gp is not None, bool(iq_pairs))
     fobj = field_cls(sf.name, H=H, C=C, input_dim=ndim, **fkw)
     ev = strati(sf.name, C=fobj)
     for name, pts_model in iso_specs:
@@ -478,74 +506,42 @@ def _build_depositional_event(sf, units, obs, Xm, ndim, field_cls, field_kwargs,
 
 
 # ---------------------------------------------------------------------------
-# Unit-only (wcsb) chain — erosional / region-only / seed-iso branches
+# Unit-only (wcsb) chain — erosional / region-only / depositional branches
 # ---------------------------------------------------------------------------
 # When observations carry only unit (level-labelled) points (no contact points,
 # no normals), the column is built as an alternating chain of erosional
 # unconformities and depositional packages. Helpers below construct each branch.
 
-#: Name given to every erosional event's learnable iso (its threshold). The
-#: name only needs to be unique *within* an event, so it can be reused across
-#: events: resolution always happens on the specific event/parent.
+#: Name given to every erosional event's iso (its threshold; value set post-fit
+#: by :func:`estimate_isosurfaces`). The name only needs to be unique *within* an
+#: event, so it can be reused across events: resolution always happens on the
+#: specific event/parent.
 _UNCONF_ISO = "unconformity"
 
-#: Default per-field loss weights for the unit-only path. The no-overturn term is heavily
-#: up-weighted vs ``sb_loss``: curlew assembles the model with a sequential onlap/truncation
+#: Default per-field loss weights for the unit-only path (consumed by the GeoINR-side
+#: loss terms — see :class:`curlew.fields.geoinr.GeoINR` — NOT by ``HSet``,
+#: which stays all-zero here). The no-overturn term is heavily up-weighted vs the
+#: normalised inequality: curlew assembles the model with a sequential onlap/truncation
 #: combine (not GeoINR's global per-point carve), so a strongly monotone field is what keeps
 #: the *unconstrained deep region* (e.g. the basement) reliably below every younger
-#: unconformity's iso and so not wrongly truncated. ``overturn_loss`` uses the gradient
+#: unconformity's iso and so not wrongly truncated. ``overturn`` uses the gradient
 #: *magnitude* (GeoINR — the norm drives polarity correction), so it couples to the field
 #: scale; that is fine because the unit-only path pins the scale ~1 (:data:`_FIELD_SCALE`),
-#: making the term naturally O(1). (Per-package iso *ordering* is now guaranteed separately, by
-#: the monotone iso group — :meth:`~curlew.geology.geoevent.GeoEvent.addOrderedIsosurfaces` —
-#: not by this term.) ``30`` is a balanced point at 1500 epochs: band ~0.49, structure ~0.76;
-#: the basement (deepest, region-only) stays low (~0.1, climbing slowly with weight) — that is
-#: the per-field/combine ceiling, whose real fix is soft-unit/NLL coupling, not a bigger weight.
-_SB_WEIGHT = 1.0
+#: making the term naturally O(1). GeoINR's original weight (1) does NOT transfer to
+#: curlew's combine — measured head-to-head on wcsb (Siren, iq 1024, 3000 epochs):
+#: weight 1 → 66.5% of grid columns contain an older-above-younger inversion (basement
+#: leaking through non-monotone deep unconformity fields) vs 0.1% at weight 30, for only
+#: +0.014 band accuracy — so 30 stays the default.
+_IQ_WEIGHT = 1.0
 _OVERTURN_WEIGHT = 30.0
-#: Iso-values learn faster than the field (GeoINR uses ~10x the field learning rate).
-_ISO_LR_MULT = 10.0
 
 #: Field output range for the unit-only path. Both ``Siren`` and ``GeoINR`` evaluate as
 #: ``scale * mlp(x)``, and the raw network ``mlp(x)`` is O(1) at initialisation, so this
 #: ``scale`` *is* the field's value range (``BaseNF``'s default is ``1e2``). It is held at
-#: ~1 here so every field lives in ``[-1, 1]`` and the learnable iso-values can be placed
-#: at fixed, **field-type-independent** positions in that range (see :func:`_iso_inits`).
-#: Keeping ``scale`` ~1 is what makes the [-1, 1] iso-init meaningful (at ``1e2`` an iso of
-#: 0.78 is ≈0 *relative to* a ±100 field, so the iso placement is lost) and keeps the two
-#: loss terms comparable: ``sb_loss`` is scale-free (its residual is ``‖∇f‖``-normalised) while
-#: ``overturn_loss`` is magnitude-based and so naturally O(1) only when the field range is ~1.
+#: ~1 here so every field lives in ``[-1, 1]``, keeping the two loss terms comparable:
+#: the normalised inequality is scale-free (its residual is ``‖∇f‖``-normalised) while the
+#: no-overturn term is magnitude-based and so naturally O(1) only when the field range is ~1.
 _FIELD_SCALE = 1.0
-
-
-def _iso_inits(n_iso: int) -> np.ndarray:
-    """
-    Initial values for ``n_iso`` learnable iso-values, spread evenly across the field's
-    output range ``[-1, 1]`` (set by :data:`_FIELD_SCALE`), youngest (high) → oldest (low).
-
-    A **single** interface initialises at ``0`` (the middle of the range); ``k`` interfaces
-    sit at the ``k`` interior dividers of ``[-1, 1]`` partitioned into ``k + 1`` equal bands,
-    so each unit band starts with an equal share of the range. This replaces the old
-    field-evaluation-based init, which depended on the field's (now fixed) output range and
-    so produced wildly different iso-values between ``Siren`` and ``GeoINR``.
-    """
-    n = int(n_iso)
-    return np.linspace(1.0, -1.0, n + 2)[1:n + 1]
-
-
-def _sb_hset() -> HSet:
-    """
-    HSet for a unit-only field: the GeoINR-style **stratigraphic-bound** loss
-    (``sb_loss``) plus the **no-overturn** regularizer (``overturn_loss``). Both
-    residuals are gradient-normalised, so the scale-free field cannot collapse to
-    satisfy the bounds trivially.
-    """
-    return HSet().zero(sb_loss=_SB_WEIGHT, overturn_loss=_OVERTURN_WEIGHT)
-
-
-def _base_lr(field_kwargs):
-    """Field learning rate (the iso-values get ``_ISO_LR_MULT`` x this)."""
-    return float((field_kwargs or {}).get("learning_rate", 1e-3))
 
 
 def _model_grid(Xm, ndim, n=24, draw=1000):
@@ -563,13 +559,6 @@ def _trend_up(ndim):
     t = np.zeros(ndim)
     t[-1] = 1.0
     return t
-
-
-def _finalize_field_optim(fobj, field_kwargs):
-    """Rebuild the field optimiser so the learnable iso-values (added after the field was
-    constructed) are optimised, at ``_ISO_LR_MULT`` x the field learning rate."""
-    lr = _base_lr(field_kwargs)
-    fobj.init_optim(lr=lr, iso_lr=lr * _ISO_LR_MULT)
 
 
 def _cap_level_pools(obs, Xm, cap_per_unit, rng):
@@ -591,33 +580,80 @@ def _cap_level_pools(obs, Xm, cap_per_unit, rng):
     return pools
 
 
-def _make_field(field_cls, name, ndim, field_kwargs, C=None, H=None):
+def _make_field(field_cls, name, ndim, field_kwargs, C=None, strat_loss=False):
     """
-    Construct a neural field with the given (optional) CSet and HSet.
+    Construct a neural field with the given (optional) CSet.
 
-    The field output ``scale`` defaults to :data:`_FIELD_SCALE` (~1) so the learnable
-    iso-values can be initialised at fixed positions in a known range (see
-    :func:`_iso_inits`); an explicit ``scale`` in ``field_kwargs`` still wins.
+    The ``HSet`` is all-zero — on the unit-only path the loss comes entirely from
+    the GeoINR-side terms, enabled with ``strat_loss=True`` (``iq_norm_weight`` /
+    ``overturn_weight``; see :class:`curlew.fields.geoinr.GeoINR`). The
+    field output ``scale`` defaults to :data:`_FIELD_SCALE` (~1) so the no-overturn
+    magnitude term stays O(1); explicit ``field_kwargs`` entries still win.
     """
     fkw = dict(field_kwargs or {})
     fkw.setdefault("scale", _FIELD_SCALE)
-    return field_cls(name, H=H if H is not None else _sb_hset(),
-                     C=C, input_dim=ndim, **fkw)
+    if strat_loss:
+        fkw.setdefault("iq_norm_weight", _IQ_WEIGHT)
+        fkw.setdefault("overturn_weight", _OVERTURN_WEIGHT)
+    return field_cls(name, H=HSet().zero(), C=C, input_dim=ndim, **fkw)
+
+
+class _AliasField(BaseSF):
+    """
+    Read-only alias of another field: evaluates **identically** to ``target`` but owns no
+    parameters, no constraints, and produces no loss. Used for the **region-only** events
+    (the basement and the dropped top unit), whose region is bounded by the adjacent
+    unconformity: GeoINR classifies those domains with the *unconformity's* field and
+    iso-value, so the alias continues that fitted, data-aligned field into the region
+    instead of filling it with an untrained (random) network. Labels are unaffected —
+    the adjacent event's ``Overprint`` decides the boundary — only the scalar output
+    becomes meaningful.
+
+    The alias keeps its own ``name`` (the region-only event's), so ``Geode.fields``
+    entries stay distinct from the target's, and its ``C`` is ``None`` so ``loss()``
+    returns an empty :class:`~curlew.core.Pebble` — important because ``Pebble`` refuses
+    duplicate loss keys when ``GeoModel.fit`` sums the per-event losses (the target's
+    loss is already counted by the event that owns it). Valid because the aliasing event
+    is stratigraphically adjacent to its target with no deformation events between them
+    (their reference frames coincide).
+    """
+
+    def __init__(self, name, target):
+        # plain attribute (not a registered submodule): the target's parameters must
+        # remain owned/optimised by its own event only
+        object.__setattr__(self, "_target", target)
+        super().__init__(name=name, input_dim=target.input_dim)
+
+    def initField(self, **kwargs):
+        self.optim = None  # nothing to optimise
+
+    def forward(self, x, transform=True):
+        return self._target.forward(x, transform=transform)
+
+    @property
+    def scale(self):
+        return getattr(self._target, "scale", 1.0)
 
 
 def _build_region_only_event(name, levels, level_pts, ndim, field_cls, field_kwargs,
-                             onlap_iso=None):
+                             onlap_iso=None, alias_of=None):
     """
-    Build a **region-only** event (SPEC §2): a single-lithology package with a
-    free (unconstrained) field — used for the basement and the dropped top unit.
+    Build a **region-only** event (SPEC §2): a single-lithology package — used for
+    the basement and the dropped top unit.
 
-    Its field carries no constraints; it exists only to label its region and to
-    supply its unit points as above/below references to the adjacent unconformity.
-    When ``onlap_iso`` is given the event onlaps the unconformity directly below
-    it (``base=<iso name>``, ``onlap=True``); otherwise it is the oldest event and
-    keeps the default ``base=-inf``.
+    Its field carries no constraints; the event exists only to label its region and
+    to supply its unit points as above/below references to the adjacent unconformity.
+    When ``alias_of`` is given (a fitted field of the adjacent unconformity event) the
+    event's field is a loss-free :class:`_AliasField` of it, so the region's scalar is
+    the unconformity field continued past its iso (GeoINR's basement treatment) rather
+    than an untrained network. When ``onlap_iso`` is given the event onlaps the
+    unconformity directly below it (``base=<iso name>``, ``onlap=True``); otherwise it
+    is the oldest event and keeps the default ``base=-inf``.
     """
-    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=None, H=HSet().zero())
+    if alias_of is not None:
+        fobj = _AliasField(name, alias_of)
+    else:
+        fobj = _make_field(field_cls, name, ndim, field_kwargs, C=None)
     if onlap_iso is not None:
         ev = strati(name, C=fobj, mode="above", base=onlap_iso, onlap=True)
     else:
@@ -629,82 +665,81 @@ def _build_region_only_event(name, levels, level_pts, ndim, field_cls, field_kwa
 
 
 def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_pts,
-                           ndim, field_cls, field_kwargs, sb_samples, grid, trend):
+                           ndim, field_cls, field_kwargs, iq_samples, grid, trend):
     """
     Build an **erosional** unconformity event (SPEC §4.2): its own ``strati``
     event (``mode='above'``) that truncates older geology above its iso.
 
-    With no on-surface points the surface is learned from **stratigraphic-bound**
-    constraints (``CSet.sb``) relative to a single **learnable iso-value** (GeoINR's
-    ``pairwise=False`` recipe), constrained from **both** sides:
+    With no on-surface points the surface is constrained purely by **point-vs-point
+    inequalities** (``CSet.iq``), consumed by the GeoINR gradient-normalised
+    inequality loss: the immediately-**younger** package (which onlaps this
+    unconformity) is ordered ``>`` **every** level older than the unconformity
+    (eroded unit + all older — SPEC §4.2). The full older side is essential: the
+    no-overturn regularizer alone is too weak to keep the field monotone in the
+    *unconstrained* deep region, so without explicit ordering a distant older unit
+    (e.g. the basement) floats high and gets wrongly truncated by this unconformity.
+    The above side is **pooled into one** (the onlapping package is only 1–3 capped
+    levels, so balance is safe) while the below side keeps one pool per level so
+    every older unit stays represented (SPEC §4.4) — pairs scale with ``|below|``
+    rather than ``|above| x |below|``, which is what keeps large per-epoch sample
+    counts (``iq_samples`` ~1000, GeoINR-style) tractable. The **no-overturn**
+    regularizer keeps successive surfaces nesting.
 
-    - **above** (``'>'``): the immediately-**younger** package (``above_levels``, which
-      onlaps this unconformity). Using just the adjacent package pins the iso at the
-      right stratigraphic level (just above the eroded unit) without the deep iso being
-      pulled around by far-younger levels.
-    - **below** (``'<'``): **every** level older than the unconformity (SPEC §4.2 — "below
-      = everything older in the column"). This is essential: the no-overturn regularizer
-      alone is too weak to keep the field monotone in the *unconstrained* deep region, so
-      without an explicit below-constraint a distant older unit (e.g. the basement) floats
-      above the iso and gets wrongly truncated by this unconformity.
-
-    Residuals are normalised by ``‖∇f‖`` and the above/below sides are balanced in the
-    loss (so a lone deep below-level is not swamped). The **no-overturn** regularizer
-    keeps successive surfaces nesting. The learnable iso doubles as the ``Overprint``
-    threshold and the extraction iso; one ``sb`` pool per level keeps every unit
-    represented (SPEC §4.4).
+    No iso-value exists at build time — the ``Overprint`` threshold is the iso
+    *name* (resolved at predict), and its value is estimated after fitting by
+    :func:`estimate_isosurfaces` (between the onlapping package's and the eroded
+    unit's field-value distributions).
     """
-    above = list(above_levels)
-    below_levels = [L for L in sorted(all_levels) if L >= eroded_level]  # eroded unit + all older
-
     def pool(L):
         return level_pts.get(L, np.empty((0, ndim)))
 
-    sb_entries = ([(pool(L), _UNCONF_ISO, ">") for L in above if len(pool(L))]
-                  + [(pool(L), _UNCONF_ISO, "<") for L in below_levels if len(pool(L))])
-    sb_relations = ([(L, _UNCONF_ISO, ">") for L in above if len(pool(L))]
-                    + [(L, _UNCONF_ISO, "<") for L in below_levels if len(pool(L))])
+    above = [L for L in above_levels if len(pool(L))]
+    below = [L for L in sorted(all_levels) if L >= eroded_level and len(pool(L))]  # eroded + all older
+
+    iq_pairs, iq_relations = [], []
+    if above and below:
+        above_pool = np.concatenate([pool(A) for A in above], axis=0)
+        iq_pairs = [(above_pool, pool(B), ">") for B in below]
+        # relation entries carry the pooled above side as a tuple of levels
+        iq_relations = [(tuple(above), B, ">") for B in below]
 
     C = CSet(crs="model")
-    if sb_entries:
-        C.sb = (int(sb_samples), sb_entries)
+    if iq_pairs:
+        C.iq = (int(iq_samples), iq_pairs)
     C.grid = grid.copy()
     C.trend = trend
-    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, H=_sb_hset())
+    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True)
 
     ev = strati(name, C=fobj, mode="above", base=_UNCONF_ISO)
-    # single interface → initialise the iso at the middle of the field's output range (0;
-    # see _iso_inits). The field starts ~scale-normalised, so 0 sits between the above
-    # units (driven >0) and the below units (driven <0); the sb loss then refines it.
-    next_younger = max(above_levels) if above_levels else eroded_level
-    ev.addIsosurface(_UNCONF_ISO, learnable=float(_iso_inits(1)[0]))
-    _finalize_field_optim(fobj, field_kwargs)
 
     meta = _FieldMeta(name=name, kind="erosional", unit_indices=[],
                       is_unconformity=True, iso_name=_UNCONF_ISO,
-                      above_levels=list(above_levels), below_levels=list(below_levels),
-                      n_iq=len(sb_entries), sb_relations=sb_relations)
-    meta.iso_above_level = next_younger
-    meta.iso_below_level = eroded_level
+                      above_levels=list(above_levels), below_levels=list(below),
+                      eroded_level=eroded_level,
+                      n_iq=len(iq_pairs), iq_relations=iq_relations)
     return ev, meta
 
 
-def _build_depositional_sb_event(name, levels_young_to_old, unit_name, level_pts,
-                                 ndim, field_cls, field_kwargs, sb_samples,
+def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts,
+                                 ndim, field_cls, field_kwargs, iq_samples,
                                  grid, trend, onlap_iso=None):
     """
     Build a **depositional** package from unit points only (SPEC §4.2, wcsb).
 
     ``levels_young_to_old`` are the package's unit levels (ascending = youngest→oldest).
-    The internal contacts are one **monotone group** of learnable iso-values (ordered by
-    construction — see :meth:`~curlew.geology.geoevent.GeoEvent.addOrderedIsosurfaces` — so
-    two contacts can pinch to zero thickness but never cross). Each contact is **named after
-    the older unit whose top it is** (so an eroded top unit never names a contact — its true
-    top is the unconformity), while its lithology label is the younger band immediately above
-    it. Each unit is bound (``CSet.sb``) **above** the contact directly below it and **below**
-    the contact directly above it; a **no-overturn** regularizer keeps the field monotone. The
-    oldest band is the event's base lithology (the event name); younger bands become isosurface
-    lithologies. When ``onlap_iso`` is given the package onlaps the unconformity below it.
+    Each pair of **adjacent** bands is ordered with a point-vs-point inequality
+    (``CSet.iq``: younger band points ``>`` older band points), consumed by the GeoINR
+    gradient-normalised inequality loss; a **no-overturn** regularizer keeps the field
+    monotone. The internal contacts carry no value at build time — they are estimated
+    after fitting by :func:`estimate_isosurfaces` (between the two adjacent bands'
+    field-value distributions). Each contact is **named after the older unit whose top
+    it is** (so an eroded top unit never names a contact — its true top is the
+    unconformity; e.g. there is no "Pennsylvanian" contact). Note curlew labels the
+    band immediately *above* an isosurface with the isosurface's name, so the band
+    lithology *keys* read like surface names (``"<pkg>_<older unit> Top"``) — the
+    ``level_litho`` map keeps the level→lithology bookkeeping exact. The oldest band
+    is the event's base lithology (the event name). When ``onlap_iso`` is given the
+    package onlaps the unconformity below it.
     """
     levels = list(levels_young_to_old)
     k = len(levels)
@@ -712,66 +747,47 @@ def _build_depositional_sb_event(name, levels_young_to_old, unit_name, level_pts
     def pool(L):
         return level_pts.get(L, np.empty((0, ndim)))
 
-    # Contact j sits between band j (younger) and band j+1 (older): it is the TOP of band j+1,
-    # so name it after that older unit (matching curlew's "isosurface = formation top" reading).
-    # Its lithology label is the band immediately ABOVE it (band j, the younger one) — curlew
-    # assigns the band above an isosurface that isosurface's lithology. These differ precisely
-    # for an eroded top unit, whose real top is the unconformity (a separate event) and so never
-    # names a depositional contact (e.g. there is no "Pennsylvanian" contact).
-    contact_names = [f"{unit_name(levels[j + 1])} Top" for j in range(k - 1)]   # iso/surface keys
-    contact_litho = [unit_name(levels[j]) for j in range(k - 1)]                # band above (lithology)
-    sb_entries, sb_relations = [], []
-    for m in range(k):
-        if len(pool(levels[m])) == 0:
-            continue
-        if m < k - 1:               # band m is above the contact below it
-            sb_entries.append((pool(levels[m]), contact_names[m], ">"))
-            sb_relations.append((levels[m], contact_names[m], ">"))
-        if m > 0:                   # band m is below the contact above it
-            sb_entries.append((pool(levels[m]), contact_names[m - 1], "<"))
-            sb_relations.append((levels[m], contact_names[m - 1], "<"))
+    # Contact j sits between band j (younger) and band j+1 (older): it is the TOP of band
+    # j+1, so name it after that older unit (a contact is the top of the unit below it).
+    contact_names = [f"{unit_name(levels[j + 1])} Top" for j in range(k - 1)]
+
+    # adjacent-band ordering: band j above band j+1 (transitivity orders the whole package)
+    iq_pairs, iq_relations = [], []
+    for j in range(k - 1):
+        if len(pool(levels[j])) and len(pool(levels[j + 1])):
+            iq_pairs.append((pool(levels[j]), pool(levels[j + 1]), ">"))
+            iq_relations.append((levels[j], levels[j + 1], ">"))
 
     C = CSet(crs="model")
-    if sb_entries:
-        C.sb = (int(sb_samples), sb_entries)
+    if iq_pairs:
+        C.iq = (int(iq_samples), iq_pairs)
     C.grid = grid.copy()
     C.trend = trend
-    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, H=_sb_hset())
+    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True)
 
     if onlap_iso is not None:
         ev = strati(name, C=fobj, mode="above", base=onlap_iso, onlap=True)
     else:
         ev = strati(name, C=fobj)
 
-    # initialise the k-1 contact isos evenly across the field's output range,
-    # younger (high) → older (low); a single contact → 0 (see _iso_inits). Independent
-    # of field type because the field output range is fixed by _FIELD_SCALE.
-    inits = _iso_inits(k - 1)
-
     oldest = levels[-1]
     level_litho = {oldest: name}              # base lithology (oldest band = event name)
     contacts = []
-    # one monotone group for the package's conformable contacts: the learnable iso-values are
-    # ordered by construction, so two contacts can pinch to zero thickness but never cross
-    # (which is what made a thin/sparse band's contacts swap before). ``litho=`` keeps each
-    # contact's lithology attached to the (younger) band above it while the contact is named
-    # after the older unit whose top it is.
-    if contact_names:
-        ev.addOrderedIsosurfaces(contact_names, [float(v) for v in inits], litho=contact_litho)
     for j, cname in enumerate(contact_names):
-        level_litho[levels[j]] = f"{name}_{contact_litho[j]}"
+        # band j (younger) sits above contact j, so its lithology key is the contact's
+        # llookup key (curlew names the band above an iso after the iso)
+        level_litho[levels[j]] = f"{name}_{cname}"
         contacts.append(_ContactInfo(name=cname, unit_index=-1, level=levels[j],
                                      n_points=len(pool(levels[j]))))
-    _finalize_field_optim(fobj, field_kwargs)
 
     meta = _FieldMeta(name=name, kind="depositional", unit_indices=[],
                       levels=levels, contacts=contacts, level_litho=level_litho,
-                      n_iq=len(sb_entries), sb_relations=sb_relations)
+                      n_iq=len(iq_pairs), iq_relations=iq_relations)
     return ev, meta
 
 
 def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwargs,
-                           sb_samples, cap_per_unit, seed):
+                           iq_samples, cap_per_unit, seed, reg_samples, reg_grid_n):
     """
     Build the wcsb-style event chain (oldest→youngest) from unit points only.
 
@@ -780,19 +796,26 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
 
     1. synthesizes a **region-only basement** from the oldest erosional field's
        attached unit(s) (``derive_scalar_fields`` does not emit it — SPEC §8.1),
-    2. builds each **erosional** event (learnable iso, ``sb`` above/below constraints,
-       no-overturn) — see :func:`_build_erosional_event`,
-    3. builds each **depositional** package (learnable per-contact isos, ``sb`` band
-       constraints, no-overturn), onlapping the unconformity below it,
+    2. builds each **erosional** event (``iq`` above-vs-below ordering, no-overturn)
+       — see :func:`_build_erosional_event`,
+    3. builds each **depositional** package (``iq`` adjacent-band ordering,
+       no-overturn), onlapping the unconformity below it,
     4. synthesizes a **region-only** event for the dropped youngest baselap unit
        (top of column), onlapping the youngest unconformity.
 
-    Returns ``(events, field_meta, level_litho)``.
+    Surface iso-values are NOT set here — call :func:`estimate_isosurfaces` after
+    fitting. Returns ``(events, field_meta, level_litho, level_pts)``.
     """
+    assert isinstance(field_cls, type) and issubclass(field_cls, GeoINR), (
+        "The unit-only path requires a GeoINR-family field ('GeoINR' or 'Siren'): its "
+        "constraints are pure inequalities, which need the gradient-normalised "
+        "inequality + no-overturn losses these fields implement."
+    )
     rng = np.random.default_rng(seed)
     level_pts = _cap_level_pools(obs, Xm, cap_per_unit, rng)
     level_name = {u.level: u.name.strip() or f"level{u.level}" for u in units}
-    grid = _model_grid(Xm, ndim)        # shared no-overturn grid (model coords)
+    # shared no-overturn grid (model coords); GeoINR-scale sampling by default
+    grid = _model_grid(Xm, ndim, n=reg_grid_n, draw=reg_samples)
     trend = _trend_up(ndim)             # younging-up direction (+z)
 
     used_names = set()
@@ -813,17 +836,9 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
     all_levels = sorted(level_pts.keys())
     events, metas, level_litho = [], [], {}
 
+    last_erosional = None
     for i, sf in enumerate(sfields_old):
         if sf.kind == "erosional":
-            # the oldest erosional eroded the basement: synthesize a region-only basement
-            # event first (the eroded unit(s) become its lithology).
-            if i == 0:
-                base_levels = sorted({units[u].level for u in sf.unit_indices})
-                bname = uniq(unit_name(base_levels[-1]) if base_levels else "Basement")
-                bev, bmeta = _build_region_only_event(
-                    bname, base_levels, level_pts, ndim, field_cls, field_kwargs)
-                events.append(bev); metas.append(bmeta); level_litho.update(bmeta.level_litho)
-
             # the younger package that onlaps this unconformity (the dropped top unit for
             # the youngest erosional, synthesized after the loop). This sets the local iso
             # placement; the below side is "everything older", computed in the builder.
@@ -836,33 +851,155 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
             ename = uniq(f"{unit_name(eroded_level)} Unconformity")
             ev, meta = _build_erosional_event(
                 ename, eroded_level, above_levels, all_levels, level_pts, ndim,
-                field_cls, field_kwargs, sb_samples, grid, trend)
+                field_cls, field_kwargs, iq_samples, grid, trend)
+
+            # the oldest erosional eroded the basement: synthesize a region-only basement
+            # event below it (the eroded unit(s) become its lithology). Its field is an
+            # alias of this unconformity's field — GeoINR classifies the basement domain
+            # with the basement interface's own field + iso, so the deep scalar is the
+            # fitted unconformity field continued below its iso, not an untrained network.
+            if i == 0:
+                base_levels = sorted({units[u].level for u in sf.unit_indices})
+                bname = uniq(unit_name(base_levels[-1]) if base_levels else "Basement")
+                bev, bmeta = _build_region_only_event(
+                    bname, base_levels, level_pts, ndim, field_cls, field_kwargs,
+                    alias_of=ev.getField(0))
+                events.append(bev); metas.append(bmeta); level_litho.update(bmeta.level_litho)
+
             events.append(ev); metas.append(meta)
+            last_erosional = ev
         else:  # depositional package
             levels = sorted({units[u].level for u in sf.unit_indices})  # young → old
             onlap_iso = _UNCONF_ISO if (metas and metas[-1].is_unconformity) else None
             pname = uniq(unit_name(levels[-1]))   # base (oldest) band names the event
-            ev, meta = _build_depositional_sb_event(
+            ev, meta = _build_depositional_iq_event(
                 pname, levels, unit_name, level_pts, ndim, field_cls, field_kwargs,
-                sb_samples, grid, trend, onlap_iso=onlap_iso)
+                iq_samples, grid, trend, onlap_iso=onlap_iso)
             events.append(ev); metas.append(meta); level_litho.update(meta.level_litho)
 
     # synthesize the dropped youngest unit (a top baselap package the partitioner
-    # skips): a region-only event onlapping the youngest unconformity.
+    # skips): a region-only event onlapping the youngest unconformity, with its field
+    # aliasing that unconformity's field (its region = above the unconformity's iso).
     top = units[0]
     if top.level not in level_litho:
-        onlap_iso = _UNCONF_ISO if (metas and metas[-1].is_unconformity) else None
+        onlap = bool(metas and metas[-1].is_unconformity and last_erosional is not None)
         qname = uniq(unit_name(top.level))
         qev, qmeta = _build_region_only_event(
-            qname, [top.level], level_pts, ndim, field_cls, field_kwargs, onlap_iso=onlap_iso)
+            qname, [top.level], level_pts, ndim, field_cls, field_kwargs,
+            onlap_iso=_UNCONF_ISO if onlap else None,
+            alias_of=last_erosional.getField(0) if onlap else None)
         events.append(qev); metas.append(qmeta); level_litho.update(qmeta.level_litho)
 
-    return events, metas, level_litho
+    return events, metas, level_litho, level_pts
+
+
+# ---------------------------------------------------------------------------
+# Post-fit isosurface estimation (unit-only path)
+# ---------------------------------------------------------------------------
+def estimate_isosurfaces(M) -> dict:
+    """
+    Estimate and set every surface iso-value of a **unit-only** model from its
+    fitted fields.
+
+    The unit-only path has no on-surface observations, so surfaces cannot be seeded
+    or fixed at build time. Instead, after ``M.fit`` this estimates each surface as
+    the value that separates the field-value distributions of the two unit-point
+    populations it lies between — the **midpoint of their medians** — and sets it
+    with the ordinary :meth:`~curlew.geology.geoevent.GeoEvent.addIsosurface`:
+
+    - a **depositional contact** separates its two adjacent bands (closest band with
+      points on each side, so empty levels are skipped). A package's contacts are then
+      **clamped to stratigraphic order** (strictly decreasing youngest→oldest): where two
+      bands' field-value distributions overlap so much that their raw midpoints invert,
+      the offending contact is pulled just below the one above it, so the inseparable
+      band **pinches out** instead of crossing — crossed contacts would label bands out
+      of stratigraphic sequence;
+    - an **unconformity** separates the onlapping (adjacent-younger) package from the
+      eroded unit directly below it.
+
+    The estimated value becomes both the event's ``Overprint`` threshold (the iso
+    *name* was wired at build time and resolves at predict) and the extraction iso.
+    Call this **after** ``M.fit`` and **before** ``M.predict``; surfaces are estimates
+    (unconformities are the hardest), and re-calling after further fitting simply
+    overwrites them.
+
+    Parameters
+    ----------
+    M : curlew.geology.geomodel.GeoModel
+        A fitted model built by :func:`build_geomodel`'s unit-only path.
+
+    Returns
+    -------
+    dict
+        Maps each isosurface's lithology key (``"<event>_<iso name>"``) to the
+        estimated value (in field/model units).
+    """
+    level_pts = getattr(M, "level_points", None)
+    assert level_pts is not None, (
+        "estimate_isosurfaces requires a model built by build_geomodel's unit-only path "
+        "(M.level_points missing)."
+    )
+
+    def median_value(ev, levels):
+        """Median field value of ``ev`` over the pooled unit points of ``levels`` (model coords)."""
+        pts = np.concatenate([level_pts[L] for L in levels
+                              if len(level_pts.get(L, ())) > 0], axis=0)
+        g = ev.predict(pts, combine=False, to_numpy=True, litho=False,
+                       props=False, isosurfaces=False)
+        return float(np.median(g.scalar))
+
+    def closest_with_points(levels):
+        """First level in ``levels`` (given closest-first) that has unit points."""
+        for L in levels:
+            if len(level_pts.get(L, ())) > 0:
+                return L
+        return None
+
+    out = {}
+    for meta in M.field_meta:
+        if meta.kind == "region-only":
+            continue
+        ev = M[meta.name]
+        if meta.is_unconformity:
+            above = [L for L in meta.above_levels if len(level_pts.get(L, ())) > 0]
+            below = closest_with_points(sorted(meta.below_levels))  # eroded unit (or closest older)
+            assert above and below is not None, (
+                f"Cannot estimate iso for '{meta.name}': no unit points above/below it."
+            )
+            iso = 0.5 * (median_value(ev, above) + median_value(ev, [below]))
+            ev.addIsosurface(meta.iso_name, value=iso)
+            out[f"{meta.name}_{meta.iso_name}"] = iso
+        else:
+            # contact j separates band levels[j] (younger) from levels[j+1] (older)
+            values = []
+            for j, contact in enumerate(meta.contacts):
+                younger = closest_with_points(meta.levels[j::-1])      # j, j-1, ..., 0
+                older = closest_with_points(meta.levels[j + 1:])       # j+1, j+2, ...
+                assert younger is not None and older is not None, (
+                    f"Cannot estimate contact '{contact.name}' on '{meta.name}': "
+                    "no unit points on one side."
+                )
+                values.append(0.5 * (median_value(ev, [younger]) + median_value(ev, [older])))
+            # clamp to stratigraphic order (strictly decreasing young -> old): if two bands
+            # overlap enough that their raw midpoints invert, pull the lower contact just
+            # below the one above it, so the inseparable band pinches out rather than
+            # crossing (crossed isos would label the bands out of stratigraphic sequence).
+            for j in range(1, len(values)):
+                values[j] = min(values[j], values[j - 1] - 1e-8)
+            # insert OLDEST-first: lithology IDs are numbered in isosurface insertion order
+            # (after the event's base lithology), and events are numbered oldest->youngest,
+            # so this keeps lithoID monotone with age (ascending ID = younger) across the
+            # whole model -- the natural reading when inspecting exported volumes.
+            for contact, iso in zip(reversed(meta.contacts), reversed(values)):
+                ev.addIsosurface(contact.name, value=iso)
+                out[f"{meta.name}_{contact.name}"] = iso
+    return out
 
 
 def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
                    scale="isometric", transform=None, cap_per_unit=None,
-                   field_kwargs=None, hset=None, iq_samples=256, seed=0) -> GeoModel:
+                   field_kwargs=None, hset=None, iq_samples=256,
+                   reg_samples=5000, reg_grid_n=48, seed=0) -> GeoModel:
     """
     Build a ready-to-fit :class:`~curlew.geology.geomodel.GeoModel` from a
     stratigraphic-column CSV and point observations.
@@ -874,10 +1011,14 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
       isosurfaces, ``gv`` gradients (where normals exist) and ``iq`` inequalities.
     - **Unit-only path** (only level-labelled unit points, e.g. ``wcsb``): the
       column is built as an alternating chain of erosional unconformities and
-      depositional packages with synthesized region-only events at both ends. Every
-      surface is a **learnable iso-value** constrained by units above/below it via the
-      gradient-normalised stratigraphic-bound loss (``CSet.sb``) plus a no-overturn
-      regularizer — GeoINR's per-field recipe (see :func:`_build_unit_only_chain`).
+      depositional packages with synthesized region-only events at both ends. Each
+      field is constrained purely by point-vs-point inequalities (``CSet.iq``:
+      younger unit points above older ones) consumed by the GeoINR-family fields'
+      gradient-normalised inequality loss, plus a no-overturn regularizer (see
+      :func:`_build_unit_only_chain`; requires ``field="GeoINR"`` or ``"Siren"``).
+      Surface iso-values are not learned — after ``M.fit``, call
+      :func:`estimate_isosurfaces` to estimate and set them (required before
+      ``M.predict``).
 
     A single homogeneous normalization :class:`~curlew.geometry.Transform` is
     attached to the model.
@@ -902,16 +1043,26 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
         dominate the constraint pools (SPEC §4.4). ``None`` keeps all points. Unused
         on the on-surface path.
     field_kwargs : dict, optional
-        Extra keyword arguments forwarded to each field's ``initField`` (e.g.
-        ``hidden_dim``, ``learning_rate``). On the unit-only path the learnable
-        iso-values use ``10x`` the ``learning_rate`` given here.
+        Extra keyword arguments forwarded to each field's constructor (e.g.
+        ``hidden_dim``, ``learning_rate``; on the unit-only path also
+        ``iq_norm_weight`` / ``overturn_weight`` to override the default loss
+        weights).
     hset : curlew.core.HSet, optional
         Hyperparameters for every event on the on-surface path; a minimal default
-        is used when omitted. (The unit-only path uses a stratigraphic-bound +
-        no-overturn HSet.)
+        is used when omitted. (The unit-only path keeps ``HSet`` all-zero — its loss
+        comes from the GeoINR-side weights above.)
     iq_samples : int
-        Number of random points drawn per constraint pool each evaluation (``iq``
-        pairs on the on-surface path; ``sb`` bound points on the unit-only path).
+        Number of random points drawn per inequality pool each evaluation (both paths).
+        The GeoINR reference effectively uses *all* constraint points per epoch
+        (``max_points=0``); with units capped at ``cap_per_unit`` ~1500, ``~1024``
+        approaches that. Under-sampling leaves the deep regions of unconformity fields
+        poorly controlled (floating islands of younger packages inside the basement).
+    reg_samples : int
+        Number of no-overturn grid points sampled per epoch on the unit-only path
+        (GeoINR's ``n_grid_samples`` default is 5000). Unused on the on-surface path.
+    reg_grid_n : int
+        Resolution (divisions per axis) of the shared no-overturn grid the
+        regularization points are drawn from. Unused on the on-surface path.
     seed : int
         Random seed for unit subsampling.
 
@@ -921,7 +1072,9 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
         Model with events, CSets, isosurfaces and the normalization transform
         attached. The parsed column and per-field metadata are stored on
         ``M.strat_units``, ``M.horizons``, ``M.scalar_fields``, ``M.field_meta``
-        and (unit-only path) ``M.level_litho`` for inspection/visualisation.
+        and (unit-only path) ``M.level_litho`` / ``M.level_points`` for
+        inspection/visualisation. On the unit-only path, fit the model and then
+        call :func:`estimate_isosurfaces` before predicting.
     """
     field_cls = _FIELD_TYPES[field] if isinstance(field, str) else field
 
@@ -951,10 +1104,10 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
             events.append(ev)
             field_meta.append(meta)
     else:
-        # ---- unit-only path (wcsb): learnable-iso / sb / no-overturn chain ----
-        events, field_meta, level_litho = _build_unit_only_chain(
+        # ---- unit-only path (wcsb): iq-ordering / no-overturn chain ----
+        events, field_meta, level_litho, level_pts = _build_unit_only_chain(
             units, sfields, observations, Xm, ndim, field_cls, field_kwargs,
-            iq_samples, cap_per_unit, seed,
+            iq_samples, cap_per_unit, seed, reg_samples, reg_grid_n,
         )
 
     M = GeoModel(events, transform=transform, name=Path(strat_col_csv).stem)
@@ -967,4 +1120,7 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
     M.observations = observations
     M.normalization = transform
     M.level_litho = level_litho
+    if not bool(observations.is_interface.any()):
+        # capped per-level unit pools (model coords) — needed by estimate_isosurfaces
+        M.level_points = level_pts
     return M

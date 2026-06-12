@@ -172,6 +172,13 @@ in **world (global) coordinates** for clarity:
   younger contact's field value `>` the older contact's (the reverse `<` is then
   automatic, so only one direction is stored). The `iq pools` count is printed below.
 
+With a GeoINR-family field (as here) both are consumed by GeoINR's
+**gradient-normalised** losses on the field itself — interface: `|Δf|/‖∇f‖` between
+points of the same contact; inequality: the hinged `(f(P1)−f(P2))/‖∇f(P1)‖` — so the
+residuals behave like distances and the field cannot shrink its output range to
+satisfy them trivially. Only the bedding-normal (`grad_loss`) term uses the generic
+`HSet`.
+
 **On the normals.** The builder stores constraints in *model* coordinates, but the
 normalization here is **isometric** (a uniform scale + translate), which **preserves
 directions** — so the bedding-normal vectors are identical in world and model space
@@ -206,8 +213,10 @@ plt.tight_layout(); plt.show()
 n_iq = 0 if C.iq is None else len(C.iq[1])
 print(f"CSet: eq traces={0 if C.eq is None else len(C.eq)}  "
       f"gv normals={0 if C.gp is None else C.gp.shape[0]}  iq pools={n_iq}")
-print("HSet (active terms):", {k: getattr(ev.field.H, k) for k in
-      ['eq_loss', 'grad_loss', 'iq_loss']})""")
+print("HSet (generic terms):", {k: getattr(ev.field.H, k) for k in
+      ['eq_loss', 'grad_loss', 'iq_loss']})
+print("GeoINR loss weights:", {k: getattr(ev.field, k) for k in
+      ['eq_norm_weight', 'iq_norm_weight', 'overturn_weight']})""")
 
 
 # ---------------------------------------------------------------- 4. fit

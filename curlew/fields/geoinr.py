@@ -1,11 +1,14 @@
 """
-Neural fields ported from GeoINR: a plain multi-layer perceptron (`GeoINR`) and
-a sine-activation network (`Siren`), both implemented as `curlew.fields.BaseNF`
-subclasses so they slot into Curlew's events/constraints/fit machinery.
+Neural fields ported from GeoINR (Hillier et al., 2023): coordinate-based INR networks
+(no Fourier-feature encoding; coordinates are expected pre-normalised to a ~unit range)
+paired with GeoINR's **gradient-normalised** loss terms.
 
-Loss and fit are inherited from `curlew.fields.BaseNF` unchanged — these classes
-only build the network (`initField`) and define the forward evaluation
-(`evaluate`).
+`GeoINR` is the base of the family: it builds a plain multi-layer perceptron and carries
+the shared GeoINR loss terms (see `GeoINR.loss`); subclasses swap only the network
+architecture — `Siren` replaces the MLP with a sine-activation stack. Fit is inherited
+from `curlew.fields.BaseNF` unchanged, and all GeoINR loss terms are **disabled by
+default**, so these fields behave exactly like any other `BaseNF` (generic
+`curlew.core.HSet`-driven losses) unless the extra weights are set.
 """
 
 import curlew
@@ -19,15 +22,49 @@ class GeoINR(BaseNF):
     """
     GeoINR-inspired neural field for interpolation of geological structures.
 
-    A plain multi-layer perceptron mapping coordinates to a scalar potential.
-    Hidden layers use a smooth activation (``Softplus`` by default); the final
-    layer is linear. Weights use Kaiming-uniform initialisation (``fan_in``,
-    ReLU gain), mirroring GeoINR's ``Perceptron``.
+    The base class of the GeoINR family: a plain multi-layer perceptron mapping
+    coordinates to a scalar potential (hidden layers use ``Softplus`` by default;
+    the final layer is linear; Kaiming-uniform init, mirroring GeoINR's
+    ``Perceptron``). Subclasses swap the architecture by overriding ``initField``
+    (see `Siren`); the loss terms below are shared by the whole family.
+
+    In addition to the generic `curlew.fields.BaseSF.loss` terms, `loss` adds
+    GeoINR's **gradient-normalised** terms, each gated by a constructor weight
+    (NOT by `curlew.core.HSet`, which stays generic) and disabled (0) by default:
+
+    - ``eq_norm_weight`` — **interface** loss over the traces in ``CSet.eq``: the
+      pairwise residual ``|f(P) - f(P_ref)| / ‖∇f(P)‖`` between points of the *same*
+      interface (GeoINR's ``interface_loss_using_pairs``). Behaves like a distance
+      from the interface, so the field cannot shrink its output range to satisfy
+      the traces trivially. When used, leave ``HSet.eq_loss`` at 0.
+    - ``iq_norm_weight`` — **inequality** loss over the pairs in ``CSet.iq``: the
+      residual ``(f(P1) - f(P2)) / ‖∇f(P1)‖`` hinged by each pair's relation
+      (GeoINR's above/below losses) and averaged over **active violations only**,
+      so satisfied pairs do not dilute coherent violation clusters. When used,
+      leave ``HSet.iq_loss`` at 0.
+    - ``overturn_weight`` — **no-overturn** regularizer sampled on ``CSet.grid``:
+      penalises the field decreasing in the younging direction (``CSet.trend``, or
+      +last axis). The penalty is the *magnitude* of the downward gradient component
+      (NOT normalised to a cosine — the gradient norm is what drives polarity
+      correction and keeps the field monotone in the younging direction). Because it
+      is magnitude-based it couples to the field's output ``scale``; keep that ~1
+      (as the unit-only strat builder does) so the term stays O(1).
+
+    ``norm_samples`` sets how many points are drawn per ``eq`` trace each step for
+    the interface loss (``iq`` pairs use the count stored in ``CSet.iq``).
 
     See Hillier et al., 2023 for further details:
 
     `Hillier, Michael, et al. "GeoINR 1.0: an implicit neural network approach to three-dimensional geological modelling." Geoscientific Model Development 16.23 (2023): 6987-7012.`
     """
+
+    def __init__(self, *args, eq_norm_weight: float = 0.0, iq_norm_weight: float = 0.0,
+                 overturn_weight: float = 0.0, norm_samples: int = 256, **kwargs):
+        self.eq_norm_weight = float(eq_norm_weight)
+        self.iq_norm_weight = float(iq_norm_weight)
+        self.overturn_weight = float(overturn_weight)
+        self.norm_samples = int(norm_samples)
+        super().__init__(*args, **kwargs)
 
     def initField(self,
                   hidden_dim: int = 256,
@@ -91,6 +128,87 @@ class GeoINR(BaseNF):
         """
         return self.scale * self.mlp(x)
 
+    def loss(self, transform=True):
+        """
+        Compute the loss pebble for this field: the generic `curlew.fields.BaseSF.loss`
+        terms plus (when their weights are non-zero) the GeoINR normalised interface,
+        normalised inequality, and no-overturn terms described on `GeoINR`.
+        """
+        pebble = super().loss(transform=transform)
+        C = self.C
+        if C is None:
+            return pebble
+
+        # gradient-normalised interface loss over CSet.eq traces: pairwise |Δf|/‖∇f‖
+        # between points of the same interface (GeoINR's interface_loss_using_pairs)
+        if (C.eq is not None) and (self.eq_norm_weight > 0):
+            ns = self.norm_samples
+            p_list, r_list = [], []
+            for trace in C.eq:
+                n = trace.shape[0]
+                if n < 2:
+                    continue
+                pi = torch.randint(0, n, (ns,), device=curlew.device)
+                ri = torch.randint(0, n, (ns,), device=curlew.device)
+                p_list.append(trace[pi])
+                r_list.append(trace[ri])
+            if p_list:
+                grad, v = self.gradient(torch.cat(p_list, dim=0), normalize=False,
+                                        transform=transform, return_value=True,
+                                        retain_graph=True, create_graph=True,
+                                        accumulate=False)
+                vr = self(torch.cat(r_list, dim=0), transform=transform).flatten()
+                r = (v.flatten() - vr).abs() / (torch.norm(grad, dim=-1) + 1e-6)
+                pebble.push(self.name, 'eq_norm_loss', r.mean(),
+                            weight=self.eq_norm_weight, optim=self.optim)
+
+        # gradient-normalised inequality over CSet.iq pairs
+        if (C.iq is not None) and (self.iq_norm_weight > 0):
+            ns = int(C.iq[0])
+            p1_list, p2_list, rels = [], [], []
+            for start, end, rel in C.iq[1]:
+                if (start.shape[0] == 0) or (end.shape[0] == 0):
+                    continue
+                six = torch.randint(0, start.shape[0], (ns,), device=curlew.device)
+                eix = torch.randint(0, end.shape[0], (ns,), device=curlew.device)
+                p1_list.append(start[six])
+                p2_list.append(end[eix])
+                rels.append(rel if isinstance(rel, str) else str(rel))
+            if p1_list:
+                grad, v1 = self.gradient(torch.cat(p1_list, dim=0), normalize=False,
+                                         transform=transform, return_value=True,
+                                         retain_graph=True, create_graph=True,
+                                         accumulate=False)
+                v2 = self(torch.cat(p2_list, dim=0), transform=transform).flatten()
+                r = (v1.flatten() - v2) / (torch.norm(grad, dim=-1) + 1e-6)
+                viols = []
+                for i, rel in enumerate(rels):
+                    ri = r[i * ns:(i + 1) * ns]
+                    if '>' in rel:   # f(P1) should exceed f(P2) → penalise negative residuals
+                        viols.append(torch.clamp_max(ri, 0).abs())
+                    else:            # '<' → penalise positive residuals
+                        viols.append(torch.clamp_min(ri, 0))
+                e = torch.cat(viols)
+                active = e[e > 0]
+                if active.numel() > 0:
+                    pebble.push(self.name, 'iq_norm_loss', active.mean(),
+                                weight=self.iq_norm_weight, optim=self.optim)
+
+        # no-overturn regularizer on grid samples
+        if (C.grid is not None) and (self.overturn_weight > 0):
+            pts = C.grid.draw(self.transform if transform else None)
+            g = self.gradient(pts, normalize=False, transform=transform,
+                              retain_graph=True, create_graph=True, accumulate=False)
+            if C.trend is not None:
+                younging = C.trend / (torch.norm(C.trend) + 1e-8)
+                gy = (g * younging[None, :]).sum(dim=-1)
+            else:
+                gy = g[:, -1]
+            pebble.push(self.name, 'overturn_loss', torch.clamp_max(gy, 0).abs().mean(),
+                        weight=self.overturn_weight, optim=self.optim)
+
+        return pebble
+
 
 class _SineLayer(nn.Module):
     """
@@ -120,14 +238,17 @@ class _SineLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(x))
 
 
-class Siren(BaseNF):
+class Siren(GeoINR):
     """
-    Sine-activation neural field (ports GeoINR's ``Siren``; Sitzmann et al., 2020).
+    Sine-activation member of the GeoINR family (ports GeoINR's ``Siren``;
+    Sitzmann et al., 2020).
 
-    A stack of `_SineLayer`s (``sin(omega_0 * Wx + b)``) followed by a linear
-    output layer. The first layer is scaled by ``omega0`` and subsequent layers
-    by ``omega``; weight bounds follow the standard SIREN initialisation so
-    activations stay well-conditioned through depth.
+    Replaces the base `GeoINR` MLP with a stack of `_SineLayer`s
+    (``sin(omega_0 * Wx + b)``) followed by a linear output layer. The first layer
+    is scaled by ``omega0`` and subsequent layers by ``omega``; weight bounds follow
+    the standard SIREN initialisation so activations stay well-conditioned through
+    depth. Losses (including the GeoINR gradient-normalised terms) and evaluation
+    are inherited from `GeoINR`.
     """
 
     def initField(self,
@@ -169,19 +290,3 @@ class Siren(BaseNF):
         # push onto device and initialise the optimiser
         self.to(curlew.device)
         self.init_optim(lr=learning_rate)
-
-    def evaluate(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the network to create a scalar value or property estimate.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            A tensor of shape (N, input_dim), where N is the batch size.
-
-        Returns
-        -------
-        torch.Tensor
-            A tensor of shape (N, output_dim), representing the scalar potential.
-        """
-        return self.scale * self.mlp(x)

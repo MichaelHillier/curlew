@@ -35,3 +35,7 @@ sandbox
 
 # MACOSX
 .DS_STORE
+
+# large prediction/export artifacts (regenerate via the wcsb notebook)
+examples/wcsb/*.vti
+examples/wcsb/*.vts
