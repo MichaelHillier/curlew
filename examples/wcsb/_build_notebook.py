@@ -6,30 +6,33 @@ and reviewable as plain source.
 
 wcsb is the complex reference dataset: 36 units (conformal / baselap / eroded)
 observed as **unit points only** (`cleaner_markers.vtp` level labels) — no contact
-points, no normals. It exercises the unit-only path of the builder, which ports
-GeoINR's per-field recipe into Curlew:
+points, no normals. It exercises the unit-only path of the builder plus GeoINR's
+**soft-unit / NLL coupling** (SOFTUNIT_SPEC) ported into Curlew:
 
   * one neural field per event (Siren or softplus-MLP), assembled by Curlew's
     native predict/combine (oldest→youngest onlap/truncation chain);
-  * each field is constrained purely by **point-vs-point inequalities** (`CSet.iq`:
-    younger unit points above older ones), consumed by the GeoINR-side
-    gradient-normalised inequality loss, residual = (f(P1) - f(P2))/‖∇f(P1)‖ —
-    which prevents field collapse;
-  * a **no-overturn** regularizer keeps each field monotone in the younging
-    direction so the unconformity surfaces nest;
-  * surfaces are **estimated post-fit** (`estimate_isosurfaces`: midpoint of the
-    adjacent units' median field values) and set as ordinary fixed iso-values;
+  * a single **joint** loss couples ALL fields plus shared, learnable iso-values in
+    one cross-entropy against the true unit *levels* (`attach_unit_loss` →
+    `UnitLoss`, passed to `M.fit(custom_loss=[...])`). The carve (`soft_unit_probs`)
+    is a per-class re-derivation of curlew's combine, so every unit point carries a
+    two-sided, always-active likelihood — unlike a hinge, which goes flat once satisfied;
+  * a **no-overturn** regularizer keeps each field monotone in the younging direction
+    so the unconformity surfaces nest (the per-field inequality loss is switched off:
+    the CE supersedes it);
+  * surfaces are **learned** — the iso-values are Parameters on the loss with a
+    per-package monotone reparam (contacts cannot cross); after fitting
+    `write_isosurfaces` sets them as ordinary fixed isos so `M.predict` reproduces the
+    model (`estimate_isosurfaces` is not used here);
   * the region-only events (basement / top unit) carry loss-free **aliases** of the
     adjacent unconformity's field (GeoINR's basement treatment), so the deep scalar
     is structured rather than an untrained network;
   * `cap_per_unit` subsampling keeps rare units represented (SPEC §4.4); the per-epoch
-    constraint budget matches GeoINR (`IQ_SAMPLES`~1024 ≈ full pools, 5000
-    regularization samples).
+    budget matches GeoINR (`POINTS_PER_LEVEL`~1024 balanced points per level).
 
-The notebook is built for **inspection**: it renders the per-field constraints and
-the per-field scalar fields (so each field can be judged on its own) as well as the
-combined model, and reports per-unit prediction accuracy. Switch `FIELD` between
-Siren and the softplus MLP to compare.
+The notebook is built for **inspection**: it renders the per-field scalar fields (so
+each field can be judged on its own) and the combined model, and reports per-point
+accuracy plus the soft-carve↔predict consistency. Switch `FIELD` between Siren and the
+softplus MLP to compare.
 """
 import nbformat as nbf
 from pathlib import Path
@@ -41,25 +44,26 @@ code = lambda s: cells.append(nbf.v4.new_code_cell(s))
 
 md(r"""# `wcsb` — strat-column → GeoModel (Curlew / GeoINR integration, complex case)
 
-Unit-only path of the GeoINR → Curlew integration (SPEC §6.2): the Western Canada
-Sedimentary Basin column (36 units, conformal/baselap/eroded) observed as **unit
-points only** (`cleaner_markers.vtp`). `build_geomodel` produces an **alternating
-chain** of erosional unconformities and depositional packages with synthesized
-region-only events at both ends (Precambrian basement at the bottom; the dropped
-top baselap unit at the top), each a neural field constrained by unit ordering.
+Unit-only path of the GeoINR → Curlew integration with the **soft-unit / NLL coupling**
+(SOFTUNIT_SPEC): the Western Canada Sedimentary Basin column (36 units,
+conformal/baselap/eroded) observed as **unit points only** (`cleaner_markers.vtp`).
+`build_geomodel` produces an **alternating chain** of erosional unconformities and
+depositional packages with synthesized region-only events at both ends (Precambrian
+basement at the bottom; the dropped top baselap unit at the top).
 
-**Loss (GeoINR's per-field `pairwise=False` recipe, on the field classes):** younger
-unit points must sit above older unit points (`CSet.iq`), with the residual
-`(f(P1) - f(P2))/‖∇f(P1)‖` normalised by the gradient so the scale-free field cannot
-collapse; a **no-overturn** term keeps the field monotone upward. Surfaces are not
-learned: after fitting, `estimate_isosurfaces` places each contact/unconformity at the
-separation value between the adjacent units' field-value distributions (midpoint of
-medians) — that value is the `Overprint` threshold and the extraction iso.
+**Loss (joint soft-unit / NLL coupling):** all scalar fields plus shared, learnable
+iso-values are coupled in one cross-entropy against the true unit levels. Each epoch the
+field stack + iso-values are carved into an `(N, C)` per-class simplex (`soft_unit_probs`,
+a per-class re-derivation of curlew's onlap/truncation combine) and trained with NLL — so
+field values are calibrated everywhere and classification is globally consistent. A
+**no-overturn** term keeps each field monotone upward; the per-field inequality loss is
+off. Surfaces are **learned** (monotone-reparam iso-values), then written into ordinary
+fixed isos by `write_isosurfaces` so `M.predict` reproduces the model.
 
-This notebook is built for **inspection**: it renders the per-field constraints and
-per-field scalar fields (each field judged on its own), the combined model, and
-per-unit accuracy. Pipeline: **load → partition → constraints → fit → per-field fields
-→ combined predict/3D → checks**.""")
+This notebook is built for **inspection**: it renders the ordering structure and
+per-field scalar fields (each field judged on its own), the combined model, per-point
+accuracy, and the soft-carve↔predict consistency. Pipeline: **load → partition →
+structure → joint fit → per-field fields → combined predict/3D → checks**.""")
 
 # ---------------------------------------------------------------- 0. setup
 md("## 0. Setup")
@@ -71,7 +75,8 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import curlew
 from curlew.io import loadObservations
-from curlew.geology.stratbuilder import build_geomodel, estimate_isosurfaces
+from curlew.geology.stratbuilder import build_geomodel, attach_unit_loss
+from curlew.geology.softunit import soft_unit_probs
 
 DEVICE = os.environ.get("CURLEW_DEVICE", "cuda")
 if DEVICE.startswith("cuda") and not torch.cuda.is_available():
@@ -95,19 +100,32 @@ if FIELD == "Siren":
     FIELD_KWARGS = dict(omega0=30.0, omega=30.0, learning_rate=1e-4, hidden_dim=256)
 else:  # softplus MLP — beta in ~[20, 50]
     FIELD_KWARGS = dict(activation=nn.Softplus(beta=40), learning_rate=1e-3, hidden_dim=256)
-CAP_PER_UNIT = 1500     # cap per unit at load (imbalance-aware, SPEC §4.4)
-IQ_SAMPLES   = 1024     # points drawn per inequality pool each step (~full pool at the cap;
-                        # GeoINR uses ALL constraint points per epoch — max_points=0)
-N_EPOCHS     = 3000     # GeoINR's count; per-field accuracy plateaus around here
+# cap per unit: on the COUPLED path balance comes from POINTS_PER_LEVEL (below), so the
+# cap only limits the distinct geometry each field sees — keep it generous (a small cap
+# starves the fields and hurts marker fit). Use None for the full point set if RAM allows.
+CAP_PER_UNIT = 20000
+IQ_SAMPLES   = 1024     # points drawn per inequality pool each step (used only to size pools)
+N_EPOCHS     = 3000     # joint CE keeps improving with budget once the carve is well-posed
 
-# per-field GeoINR loss weights (consumed by the field classes, not HSet).
-# NB: GeoINR's original overturn weight (1) does NOT transfer to curlew's sequential
-# combine: measured here, weight 1 gives 66.5% of columns an older-above-younger
-# inversion (basement leaks through non-monotone deep fields) vs 0.1% at weight 30,
-# for only +0.014 band accuracy. Lower it only if you also change the combine.
-IQ_WEIGHT       = 1.0   # gradient-normalised inequality (GeoINR's unit weight)
-OVERTURN_WEIGHT = 30.0  # no-overturn magnitude
-FIELD_KWARGS.update(iq_norm_weight=IQ_WEIGHT, overturn_weight=OVERTURN_WEIGHT)
+# --- soft-unit / NLL coupling knobs (SOFTUNIT_SPEC) -------------------------
+# The coupled path replaces the per-field inequality fit + post-hoc surface estimation
+# with ONE joint cross-entropy over all fields + learnable iso-values (§4). The carve
+# (soft_unit_probs) is a per-class re-derivation of curlew's combine; classes are unit
+# LEVELS (not lithoID). attach_unit_loss sets iq_norm_weight=0 (CE supersedes the
+# inequalities) and RELAXES overturn (see below). Learnable iso-values init uniformly
+# (correctness is owned by the monotone reparam + CE, so the init is just a convergence aid).
+TAU              = 0.05     # soft-unit temperature; sharpness s = 1/tau = 20 (GeoINR)
+POINTS_PER_LEVEL = 1024     # balanced points sampled per unit level each epoch
+
+# no-overturn weight for the COUPLED path. The per-field path needs 30 (its sequential
+# combine has no global ordering signal, so basement leaks through non-monotone deep fields
+# — weight 1 → 66.5% inverted columns). But under the coupling the always-active CE already
+# enforces ordering at every marker, so 30 is redundant AND over-smooths: it pins each field's
+# range too small to separate a package's 7–9 bands (NLL stuck ~1.06). Relaxing to ~6 drops the
+# NLL to ~0.8 (GeoINR's near-zero regularisation regime) and lifts marker accuracy, while
+# keeping predicted column inversions low (~0.5%); lower (→1) fits a touch better but lets the
+# deep unconstrained region overturn (several-% inversions). Passed to attach_unit_loss.
+OVERTURN_WEIGHT = 6.0
 print("device:", curlew.device, "| field:", FIELD, "| data:", DATA)""")
 
 # ---------------------------------------------------------------- 1. load
@@ -171,16 +189,17 @@ md("**GeoModel event graph** (`_repr_svg_`):")
 code(r"""M""")
 
 # ---------------------------------------------------------------- 3. constraints
-md(r"""## 3. Constraint relations (per field)
+md(r"""## 3. Ordering structure (per field)
 
-There are **no** `eq` traces or `gv` normals — each field is driven purely by
-**point-vs-point inequalities** (`CSet.iq`): for a depositional package, each band's
-points sit above the band directly below; for an unconformity, every level of the
-onlapping (adjacent-younger) package sits above the eroded unit **and every older
-level** (the explicit "everything older" side is what keeps the deep unconstrained
-region — the basement — below the surface; the no-overturn term alone is too weak
-there). The cell lists, **per field**, the exact level orderings recorded at build
-time. No iso-values exist yet — they are estimated after fitting (§4).""")
+There are **no** `eq` traces or `gv` normals — the builder records, per field, the
+stratigraphic **ordering** of unit levels (`meta.iq_relations`): for a depositional
+package each band sits above the band directly below; for an unconformity the onlapping
+(adjacent-younger) package sits above the eroded unit **and every older level**. On the
+**coupled** path (§4) these per-field inequalities are *not* optimised directly
+(`iq_norm_weight=0`) — the soft-unit carve (`soft_unit_probs`) re-derives the same
+youngest-first onlap/truncation ordering as a per-class likelihood, so the relations
+below are the structure the coupling encodes globally rather than per pair. Iso-values
+do not exist yet — they are **learned** during the joint fit (§4).""")
 code(r"""# exact per-field constraints recorded at build time (meta.iq_relations: list of
 # (above, below_level, '>') where `above` is one level, or a tuple of levels for the
 # pooled above side of an unconformity). Each says "<above> points sit above <below> points".
@@ -201,49 +220,63 @@ for ev, meta in zip(M.events, M.field_meta):
         print(f"      {lab(a)}  >  {rng_s}")""")
 
 # ---------------------------------------------------------------- 4. fit
-md(r"""## 4. Fit & post-hoc surface estimation
+md(r"""## 4. Joint fit — soft-unit / NLL coupling
 
-`M.fit(history=True)` trains all fields jointly and returns a per-epoch loss
-breakdown. The unit-only path learns **no** surfaces during the fit — afterwards,
-`estimate_isosurfaces(M)` places each contact/unconformity at the **midpoint of the
-median field values** of the two unit populations it separates and sets it as an
-ordinary fixed iso (this must run before `M.predict`). Below the loss curve we
-confirm **every unit** appears in ≥1 inequality (so it is resampled — `IQ_SAMPLES`
-points — every step; SPEC §4.4); the constraints come straight from
-`meta.iq_relations`, so the count is exact.""")
-code(r"""loss, pebble, history = M.fit(N_EPOCHS, early_stop=None, best=False, history=True)
+`attach_unit_loss(M)` builds a `UnitLoss` that couples **all** scalar fields
+plus shared, **learnable** iso-values in one cross-entropy against the true unit levels
+(SOFTUNIT_SPEC §2–§5). It is passed to `M.fit(custom_loss=[uloss])`, so the whole stack
+trains jointly from scratch:
+
+* each epoch it samples `POINTS_PER_LEVEL` balanced points per level, evaluates the field
+  stack via `ev.predict(combine=False, transform=True)` (deformation-correct; `M.predict`
+  untouched), and **carves** an `(N, C)` per-class simplex (`soft_unit_probs`) — a per-class
+  re-derivation of curlew's own onlap/truncation combine;
+* the loss is `NLL(log carve, true levels)`; every unit point carries a two-sided,
+  always-active likelihood (unlike a hinge, which goes flat once satisfied);
+* iso-values are learnable Parameters on the loss with a per-package **monotone reparam**
+  (`θ_j = θ_0 − cumsum(softplus(φ))`), so a package's contacts cannot cross — surfaces are
+  **learned**, not estimated (`estimate_isosurfaces` is NOT used here);
+* the no-overturn prior is kept; `iq_norm_weight` is set to 0 (the CE supersedes it).
+
+After fitting, `uloss.write_isosurfaces(M)` pushes the learned iso-values into the ordinary
+`addIsosurface(value=...)` (oldest-first, so ascending `lithoID` = younger) so `M.predict`
+reproduces the model. Below the loss curve we confirm every unit level is represented in
+the balanced pools.""")
+code(r"""uloss = attach_unit_loss(M, tau=TAU, points_per_level=POINTS_PER_LEVEL,
+                         overturn_weight=OVERTURN_WEIGHT)
+print(f"coupling: {uloss.n_classes} level-classes | {len(list(uloss._params))} iso parameter groups "
+      f"| tau={uloss.tau} (s={1/uloss.tau:.0f}) | overturn={OVERTURN_WEIGHT}")
+
+loss, pebble, history = M.fit(N_EPOCHS, early_stop=None, best=False, history=True, custom_loss=[uloss])
 print("final loss:", loss); print(pebble)
 
-isos = estimate_isosurfaces(M)     # REQUIRED on the unit-only path (before any predict)
-print(f"\nestimated {len(isos)} surface iso-values (midpoint-of-medians):")
+isos = uloss.write_isosurfaces(M)   # REQUIRED before any predict (learned iso-values)
+print(f"\nwrote {len(isos)} learned surface iso-values:")
 for k, v in isos.items():
     print(f"  {k[:48]:48s} {v:+.3f}")
 
 losses = [p.total() for p in history]
+nll = [p.losses.get("unit", {}).get("nll_loss", np.nan) for p in history]
 fig, ax = plt.subplots(1, 2, figsize=(12, 3.4))
-ax[0].plot(np.arange(1, len(losses) + 1), losses, lw=1); ax[0].set_yscale("log")
-ax[0].set_xlabel("epoch"); ax[0].set_ylabel("total loss (log)"); ax[0].grid(True, alpha=0.3)
-ax[0].set_title(f"wcsb training loss ({FIELD})")
+ax[0].plot(np.arange(1, len(losses) + 1), losses, lw=1, label="total")
+ax[0].plot(np.arange(1, len(nll) + 1), nll, lw=1, alpha=0.7, label="NLL (CE)")
+ax[0].set_yscale("log"); ax[0].legend(fontsize=8)
+ax[0].set_xlabel("epoch"); ax[0].set_ylabel("loss (log)"); ax[0].grid(True, alpha=0.3)
+ax[0].set_title(f"wcsb joint coupling loss ({FIELD})")
 
-# per-unit representation: # inequality pairs each level appears in (either side;
-# an erosional pair's above side is a pooled tuple of levels)
-rep = {L: 0 for L in obs.levels("unit")}
-for meta in M.field_meta:
-    for a, b, _ in meta.iq_relations:
-        for x in (a if isinstance(a, tuple) else (a,)):
-            rep[x] += 1
-        rep[b] += 1
+# per-unit representation in the balanced CE pools (# points per level, capped)
+rep = {L: (len(M.level_points.get(L, ())) ) for L in obs.levels("unit")}
 levels_sorted = sorted(rep)
 ax[1].bar([str(L) for L in levels_sorted], [rep[L] for L in levels_sorted])
-ax[1].set_xlabel("unit level"); ax[1].set_ylabel("# iq pairs"); ax[1].tick_params(axis="x", labelrotation=90, labelsize=6)
-ax[1].set_title(f"per-unit representation (min={min(rep.values())})")
+ax[1].set_xlabel("unit level"); ax[1].set_ylabel("# points in pool"); ax[1].tick_params(axis="x", labelrotation=90, labelsize=6)
+ax[1].set_title(f"per-level CE pool size (min={min(rep.values())})")
 plt.tight_layout(); plt.show()""")
 
 # ---------------------------------------------------------------- 5. per-field fields
 md(r"""## 5. Per-field scalar fields (inspection)
 
 Each event's field, evaluated **on its own** (`combine=False`) on a vertical section,
-with its estimated iso-surface(s) contoured. This shows whether each field is
+with its learned iso-surface(s) contoured. This shows whether each field is
 *individually* geologically reasonable (monotone, surface at the right level) —
 independently of how the sequential combine assembles them. (Note: a "turn-up" at the
 west edge is extrapolation beyond the data plus the real westward basin-margin rise,
@@ -380,16 +413,23 @@ for i, n in sorted(geode.lithoLookup.items()):
     print(f"  {i:3d}  {n}")""")
 
 # ---------------------------------------------------------------- 7. checks
-md(r"""## 7. Checks & diagnostics (SPEC §6.2)
+md(r"""## 7. Checks & diagnostics (SOFTUNIT_SPEC §7)
 
-The **structural** checks (event chain, per-unit representation) verify the
-SPEC §4.2/§4.4/§8.1 builder work and are asserted. The **fit-quality** diagnostics
-(inequality satisfaction, iso placement, per-package iso ordering) and the
-**per-point label accuracy** (lithology band / structure / basement) are *reported*
-for inspection — with this per-field model + the sequential combine the accuracy is
-bounded (key points near unconformities are mislabelled, as expected for the
-non-coupled recipe); the soft-unit/NLL coupling is the path to higher per-point
-accuracy.""")
+**Asserted** invariants: the builder structure (event chain, every unit represented),
+the **by-construction** per-package contact monotonicity (the monotone reparam), and the
+**soft-carve ↔ predict consistency** — the training assembly (argmax of the soft carve,
+in level space) agrees with the inference assembly (predict's hard `lithoID → level`),
+because both use the *same* learned iso-values and fields. This is the direct test of the
+sequential-combine fragility the coupling targets. Field-ordering / iso-placement
+diagnostics and the **per-point label accuracy** (band / structure / basement) are
+*reported* for inspection.
+
+Expect structure (package) accuracy ~0.9 and band (exact unit) accuracy ~0.7 on the full
+markers; the residual is dominated by the deep, densely-packed packages (e.g. the Granite
+Wash / Mississippian internals), where many thin bands overlap in scalar space — these are
+genuinely hard and are also the weakest levels in the GeoINR reference. Lower `OVERTURN_WEIGHT`
+fits the markers slightly better but lets the deep unconstrained region overturn (more column
+inversions in `predict`); raise it for a cleaner volume at some cost to marker fit.""")
 code(r"""metas = M.field_meta
 def fvals(ev, pts):
     with torch.no_grad():
@@ -406,41 +446,11 @@ print(f"1. event chain: {len(metas)} events "
       f"({sum(k=='region-only' for k in kinds)} region-only, {sum(m.is_unconformity for m in metas)} erosional, "
       f"{sum(k=='depositional' for k in kinds)} depositional) -> {results['event_chain']}")
 
-# 2. every unit represented
+# 2. every unit represented in the balanced CE pools
 results["every_unit_represented"] = bool(min(rep.values()) > 0)
-print(f"2. every unit in >=1 iq pair: min={min(rep.values())} -> {results['every_unit_represented']}")
+print(f"2. every unit in the CE pools: min={min(rep.values())} -> {results['every_unit_represented']}")
 
-# 3. inequality satisfaction on unit points (fraction of cross-pairs correctly ordered)
-# Field values per (event, level) from the builder's capped model-coord pools.
-sat = []
-for meta in metas:
-    if not meta.iq_relations: continue
-    ev = M[meta.name]
-    lv_set = set()
-    for a, b, _ in meta.iq_relations:
-        lv_set.update(a if isinstance(a, tuple) else (a,)); lv_set.add(b)
-    vals = {L: fvals(ev, M.level_points[L]) for L in lv_set}
-    for a, b, _ in meta.iq_relations:
-        va = np.concatenate([vals[x] for x in (a if isinstance(a, tuple) else (a,))])
-        sat.append(float(np.mean(va[:, None] > vals[b][None, :])))
-iq_sat = float(np.mean(sat))
-results["constraint_satisfaction"] = bool(iq_sat > 0.9)
-print(f"3. inequality satisfaction (mean over pairs): {iq_sat:.3f} -> {results['constraint_satisfaction']}")
-
-# 4. estimated unconformity iso between the adjacent clouds (medians, matching the estimator)
-between = True
-for meta in metas:
-    if not meta.is_unconformity: continue
-    ev = M[meta.name]
-    iso = ev.getIsovalue(meta.iso_name)
-    a = np.median(fvals(ev, np.concatenate([M.level_points[L] for L in meta.above_levels
-                                            if len(M.level_points.get(L, ())) > 0])))
-    b = np.median(fvals(ev, M.level_points[meta.eroded_level]))
-    between &= bool(b < iso < a)
-results["iso_between"] = bool(between)
-print(f"4. each unconformity iso between adjacent clouds -> {results['iso_between']}")
-
-# 5. monotonic isos per depositional field (younger contact above older)
+# 3. per-package contact monotonicity — BY CONSTRUCTION (monotone reparam, SOFTUNIT_SPEC §5)
 mono = True
 for meta in metas:
     if meta.kind != "depositional" or len(meta.contacts) < 2: continue
@@ -448,18 +458,53 @@ for meta in metas:
     iv = np.array([ev.getIsovalue(c.name) for c in meta.contacts]); d = np.diff(iv)
     mono &= bool(np.all(d < 0))
 results["iso_monotonic"] = bool(mono)
-print(f"5. per-package iso monotonicity -> {results['iso_monotonic']}")
+print(f"3. per-package iso monotonicity (by construction) -> {results['iso_monotonic']}")
+
+# 4. soft-carve <-> predict consistency (SOFTUNIT_SPEC §7): argmax(carve, level space)
+#    == predict's hard lithoID -> level. Both use the SAME learned isos + fields.
+rng = np.random.default_rng(7); cpts, clev = [], []
+for L in obs.levels("unit"):
+    idx = np.where((~obs.is_interface) & (obs.level == L))[0]
+    idx = rng.choice(idx, size=min(300, len(idx)), replace=False)
+    cpts.append(obs.coords[idx].astype(float)); clev.append(np.full(len(idx), L))
+cpts = np.vstack(cpts); clev = np.concatenate(clev)
+Xm = M.T(torch.tensor(cpts, dtype=curlew.dtype, device=curlew.device))
+with torch.no_grad():
+    cprobs = soft_unit_probs(M, Xm, uloss.resolve_isos(), uloss.tau, uloss.spec)
+carve_level = np.array([uloss.spec.class_levels[i] for i in cprobs.argmax(1).cpu().numpy()])
+gp = M.predict(cpts)
+lut2 = {M.llookup[key]: L for L, key in M.level_litho.items()}  # lithoID -> level
+pred_level = np.array([lut2.get(int(i), -1) for i in gp.lithoID])
+soft_agree = float((carve_level == pred_level).mean())
+# the two assemblies use the same learned isos+fields, so they agree up to the
+# soft-sigmoid(τ)-vs-hard-threshold boundary shells (and the erosional shell the carve
+# discards) — a high but not unity agreement; >=0.9 is the consistency tolerance.
+results["soft_predict_consistent"] = bool(soft_agree >= 0.90)
+print(f"4. soft-carve == predict (level space): {soft_agree:.4f} -> {results['soft_predict_consistent']}")
+
+# 5. (report) learned unconformity iso between the adjacent clouds (medians)
+between = []
+for meta in metas:
+    if not meta.is_unconformity: continue
+    ev = M[meta.name]
+    iso = ev.getIsovalue(meta.iso_name)
+    a = np.median(fvals(ev, np.concatenate([M.level_points[L] for L in meta.above_levels
+                                            if len(M.level_points.get(L, ())) > 0])))
+    b = np.median(fvals(ev, M.level_points[meta.eroded_level]))
+    between.append(bool(b < iso < a))
+results["iso_between"] = bool(all(between))
+print(f"5. each learned unconformity iso between adjacent clouds: {sum(between)}/{len(between)} -> {results['iso_between']}")
 
 print("\n" + "=" * 48)
-# assert only the structural builder invariants; report the fit-quality diagnostics
-# (satisfaction, iso ordering) — these depend on the fit and the post-hoc estimates.
-STRUCTURAL = ("event_chain", "every_unit_represented")
+# assert the builder structure + the coupling's by-construction / consistency invariants;
+# report the rest (iso placement is now learned by the CE, not forced between the clouds).
+ASSERTED = ("event_chain", "every_unit_represented", "iso_monotonic", "soft_predict_consistent")
 for k, v in results.items():
-    print(f"  {('PASS' if v else ('FAIL' if k in STRUCTURAL else 'report')):6s} {k}")
-assert all(results[k] for k in STRUCTURAL), "A structural (builder) check failed."
+    print(f"  {('PASS' if v else ('FAIL' if k in ASSERTED else 'report')):6s} {k}")
+assert all(results[k] for k in ASSERTED), "An asserted invariant failed."
 print("=" * 48)""")
 
-code(r"""# --- reported per-point accuracy (not asserted: per-field ceiling) ---
+code(r"""# --- reported per-point accuracy (SOFTUNIT_SPEC §7 targets: band > 0.61, basement > 0.50) ---
 rng = np.random.default_rng(3); pts, lev = [], []
 for L in obs.levels("unit"):
     idx = np.where((~obs.is_interface) & (obs.level == L))[0]
@@ -472,9 +517,9 @@ lev_struct = {L: m.name for m in metas for L in m.levels}
 lit_ok = np.array([litho[k] == M.level_litho[int(lev[k])] for k in range(len(lev))])
 str_ok = np.array([struct[k] == lev_struct[int(lev[k])] for k in range(len(lev))])
 base_level = max(obs.levels("unit"))
-print(f"label (band) accuracy   : {lit_ok.mean():.3f}")
+print(f"band accuracy           : {lit_ok.mean():.3f}   (target > 0.61)")
 print(f"structure (package) acc : {str_ok.mean():.3f}")
-print(f"basement (L{base_level}) accuracy : {lit_ok[lev == base_level].mean():.3f}")
+print(f"basement (L{base_level}) accuracy : {lit_ok[lev == base_level].mean():.3f}   (target > 0.50)")
 print("\nper-level structure accuracy (for inspection):")
 for L in obs.levels("unit"):
     m = lev == L

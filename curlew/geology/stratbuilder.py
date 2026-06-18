@@ -996,6 +996,83 @@ def estimate_isosurfaces(M) -> dict:
     return out
 
 
+#: No-overturn weight for the **coupled** (soft-unit) path. Much lower than the per-field
+#: :data:`_OVERTURN_WEIGHT` (30): there the sequential combine needs strongly monotone fields
+#: to avoid basement leakage, but here the always-active cross-entropy already enforces the
+#: stratigraphic ordering at every marker, so a strong magnitude prior is mostly redundant —
+#: and, measured on wcsb, it actively *strangles the field fit* (it over-smooths, so a package's
+#: 7–9 bands cannot separate in scalar space). Relaxing it from 30→~6 drops the NLL from ~1.06
+#: to ~0.8 (matching GeoINR's near-zero regularisation) and lifts marker accuracy, while keeping
+#: predicted column inversions low (~0.5 %); lower still (→1) fits marginally better but lets the
+#: deep unconstrained region overturn (several-% inversions in ``GeoModel.predict``'s sequential
+#: combine). 6 is the balance; tune via ``attach_unit_loss(overturn_weight=...)``.
+_COUPLED_OVERTURN_WEIGHT = 6.0
+
+
+def attach_unit_loss(M, *, tau=0.05, points_per_level=1024, iso_lr=None, weight=1.0,
+                     overturn_weight=_COUPLED_OVERTURN_WEIGHT):
+    """
+    Build a :class:`~curlew.geology.softunit.UnitLoss` for a unit-only model and switch
+    its fields onto the **coupled** recipe (SOFTUNIT_SPEC §4, §6).
+
+    This is the entry point for the unit (soft-carve / NLL) coupling: instead of fitting
+    each field independently with inequalities and estimating surfaces post-hoc, the
+    returned loss couples **all** scalar fields plus shared, learnable iso-values in one
+    cross-entropy against the true unit levels. Pass it to
+    :meth:`~curlew.geology.geomodel.GeoModel.fit` as ``custom_loss=[loss]``, then call
+    :meth:`~curlew.geology.softunit.UnitLoss.write_isosurfaces` before predicting
+    (``estimate_isosurfaces`` is **not** used on this path — the isos are learned).
+
+    On the coupled path each field's ``iq_norm_weight`` is set to 0 (the cross-entropy
+    supersedes the inequality ordering, mirroring GeoINR's ``include_unit_constraints=False``)
+    and its ``overturn_weight`` is **relaxed** to :data:`_COUPLED_OVERTURN_WEIGHT` (the CE
+    already enforces ordering at the data, so the per-field path's strong magnitude prior of
+    30 is redundant here and over-smooths the fit — see that constant). ``HSet`` stays
+    all-zero, as on the per-field path. The existing per-field path, ``_FieldMeta`` and
+    :func:`estimate_isosurfaces` are unchanged.
+
+    Parameters
+    ----------
+    M : curlew.geology.geomodel.GeoModel
+        A model built by :func:`build_geomodel`'s unit-only path (not yet fitted). Use a
+        generous ``cap_per_unit`` (or ``None``): on the coupled path balance comes from
+        ``points_per_level``, so the cap only limits the distinct geometry the fields see.
+    tau : float, optional
+        Soft-unit temperature; sharpness ``s = 1/τ`` (default 0.05 ⇒ ``s = 20``).
+    points_per_level : int, optional
+        Points sampled per level each epoch (balanced sampling, default 1024).
+    iso_lr : float, optional
+        Learning rate for the iso-value optimiser (default ~10× a coupled field's lr).
+    weight : float, optional
+        Weight on the NLL loss term (default 1.0).
+    overturn_weight : float, optional
+        No-overturn weight applied to every coupled field, overriding the value set at
+        build time. Defaults to :data:`_COUPLED_OVERTURN_WEIGHT`. Lower → better marker
+        fit but more deep-region inversions in ``GeoModel.predict``; ``None`` leaves each
+        field's built value untouched.
+
+    Returns
+    -------
+    curlew.geology.softunit.UnitLoss
+        The coupling loss, ready to pass to ``M.fit(custom_loss=[loss])``.
+    """
+    from curlew.geology.softunit import UnitLoss
+
+    assert getattr(M, "level_points", None) is not None, (
+        "attach_unit_loss requires a model built by build_geomodel's unit-only path "
+        "(M.level_points missing)."
+    )
+    # CE supersedes the per-field inequality ordering; relax the (now mostly redundant)
+    # no-overturn prior so it does not over-smooth the coupled fit.
+    for meta in M.field_meta:
+        f = M[meta.name].getField(0)
+        if hasattr(f, "iq_norm_weight"):
+            f.iq_norm_weight = 0.0
+        if (overturn_weight is not None) and hasattr(f, "overturn_weight"):
+            f.overturn_weight = float(overturn_weight)
+    return UnitLoss(M, tau=tau, points_per_level=points_per_level, iso_lr=iso_lr, weight=weight)
+
+
 def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
                    scale="isometric", transform=None, cap_per_unit=None,
                    field_kwargs=None, hset=None, iq_samples=256,
