@@ -72,22 +72,19 @@ chosen by `Overprint.defaultDomain`:
 **`defaultDomain='child'` — erosional truncation.** The boundary is *this event's own*
 field. The unconformity cuts the older beds; its surface geometry is its own.
 
-```
-   ▔▔▔▔ erosion surface  =  CHILD field iso (this event) ▔▔▔▔
-   ╲ ╲ ╲   older beds truncated at the surface   ╲ ╲ ╲
-```
+![Child-domain erosional truncation: the child event's own scalar field supplies the overprint boundary.](docs/assets/geoinr-integration/onlap-child-domain.svg)
+
+The red surface is the child event's isosurface. With `mode='above'`, points above that
+surface get the child event's output; older parent beds are cut off at that same surface.
 
 **`defaultDomain='parent'` — onlap.** The boundary is the *parent* (the older unconformity
 it sits on). Younger beds lap onto — and pinch out against — that older surface.
 
-```
-        this package (younger beds)
-   ────────────────────────────────────
-   ──────────────────────────────╮            beds ONLAP and pinch out
-   ────────────────────────────╮ │            against the unconformity
-   ~~~ unconformity = PARENT field iso ~~~      ← base follows the PARENT surface
-   ╱ ╱ older, already-truncated beds ╱ ╱
-```
+![Parent-domain onlap: the older parent unconformity field supplies the basal overprint boundary for the younger package.](docs/assets/geoinr-integration/onlap-parent-domain.svg)
+
+The orange surface is the parent unconformity's isosurface. The younger package still owns
+its internal bedding field, but its basal overprint mask is evaluated on the parent field, so
+the package thins and terminates against that older surface.
 
 In the builder ([`strati(..., onlap=True)`](curlew/geology/__init__.py)):
 
@@ -236,4 +233,26 @@ into ordinary `addIsosurface(value=...)`, **oldest-contact-first** (so ascending
 | `points_per_level` | `attach_unit_loss(...)` | balanced points/level/epoch (default 1024). |
 | `tau` | `attach_unit_loss(...)` | carve sharpness `s=1/τ` (default 0.05). |
 
-See [SOFTUNIT_STATUS.md](SOFTUNIT_STATUS.md) for the measured numbers and open items.
+---
+
+## 7. Known limitations & future work
+
+- **Vestigial `iq` on the coupled path.** `attach_unit_loss` zeros `iq_norm_weight`, so the
+  inequalities (§4) are *built but never used for the loss* — they only size the per-level
+  pools and feed the §3 inspection. Harmless, but a confusing artifact when you inspect a
+  field's `CSet.iq`. A future `build_geomodel` could skip building them when coupling is
+  intended (the build step doesn't currently know `attach_unit_loss` is coming).
+- **`overturn` is a single global knob** trading marker-fit against `predict` inversions (§6).
+  A split by event kind (strong on unconformities, weak on packages) was tried and **did not**
+  recover the basement — the deep leak is *iso placement*, not unconformity-field overturn — so
+  it was dropped. A smarter, data-aware monotonicity prior remains open.
+- **Marker-accuracy ceiling (~0.73 band on the full wcsb markers).** Dominated by the deep,
+  densely-packed packages (Granite Wash / Mississippian internals); one neural field per package
+  is the same structural limit GeoINR has, and these are its weakest levels too. (Reference-
+  comparable; see SOFTUNIT_STATUS.md for the numbers.)
+- **`softLithoID` volume artifact** (out of scope, SOFTUNIT_SPEC §8). `predict`'s differentiable
+  `softLithoID` is a scalar blend of integer class IDs, so a categorical colormap paints thin
+  shells of in-between units at boundaries. The carve already produces a clean `(N, C)` simplex —
+  exposing it at inference for volume colouring is a possible later improvement.
+
+See [SOFTUNIT_STATUS.md](SOFTUNIT_STATUS.md) for the measured numbers and the (now short) open-items list.

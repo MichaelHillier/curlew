@@ -51,40 +51,22 @@ The coupling is implemented, debugged against the GeoINR reference, and green on
 
 ## Open items
 
-### Done this session
-- [x] Rename `SoftUnitLoss → UnitLoss` (your item 4).
+### Done (the four original items)
+- [x] **Rename `SoftUnitLoss → UnitLoss`** (item 4).
+- [x] **§2 erosional print reworded** (item 2): now `"L35,36 above unconformity, L37 eroded below"`.
+- [x] **`_AliasField` design** (item 3) → documented in GEOINR_INTEGRATION.md §3 (loss-free alias
+  of the adjacent unconformity field; no params, `C=None`, so no loss / no `Pebble` clash).
+- [x] **Why event 13 has ~35 `iq` pairs** (item 3) → GEOINR_INTEGRATION.md §4. Your reading is
+  correct (Quaternary `>` every older unit ⇒ "all above the unconformity"); note they are *unused
+  for the loss under coupling* (`iq_norm_weight=0`).
 
-### Improvements (Phase 2 — notebook / UX)
-- [ ] **napari volume should colour by `level`, not `lithoID`** (your item 1). `lithoID`
-  numbering (with gaps for surface-only events) makes units *look* out-of-sequence; `level` is
-  the data's own convention (ascending = older) and matches the point observations + surfaces.
-  The `level` array is already computed for the VTK export — reuse it for `addVolume`, the
-  points, and the surface colouring so all three are consistent.
-- [ ] **§2 erosional print is confusing** (your item 2). `"iso between L35..36 / L37"` means
-  *the unconformity sits between the onlapping package (L35,36, above) and the eroded unit
-  (L37, below)*. Reword to e.g. `"L35,36 above unconformity ; L37 eroded below"`. (The
-  child-vs-parent diagram you asked for now lives in GEOINR_INTEGRATION.md §2 — optionally
-  embed a trimmed version in the notebook.)
+### Decided not to do (for now)
+- **napari volume colour by `level`** (item 1) — owner keeps `lithoID` for now; no change planned.
+- **Stop building the vestigial `iq` on the coupled path** — accepted as-is for now.
 
-### Questions — answered, now documented
-- [x] **`_AliasField` design** (your item 3) → GEOINR_INTEGRATION.md §3 (loss-free alias of the
-  adjacent unconformity field; no params, `C=None`, so no loss / no `Pebble` clash).
-- [x] **Why event 13 has ~35 `iq` pairs** (your item 3) → GEOINR_INTEGRATION.md §4. Your reading
-  is correct: Quaternary `>` every older unit ⇒ "all above the unconformity". **But note** they
-  are *unused for the loss under coupling* (`iq_norm_weight=0`).
-
-### Known limitations / candidate future work
-- [ ] **Vestigial `iq` on the coupled path.** Built but unused (only sizes pools + §3 listing).
-  Could skip building them when coupling is intended — a `build_geomodel` refactor (the build
-  step doesn't currently know coupling is coming; `attach_unit_loss` is separate).
-- [ ] **`overturn` is one global knob** trading marker-fit vs predict-inversions. A split by
-  event kind (strong on unconformities, weak on packages) was tried and **did not** recover the
-  basement (the leak is iso placement, not unconformity-field overturn), so it was dropped.
-  A smarter, data-aware monotonicity prior is open.
-- [ ] **Band-accuracy ceiling ~0.73** on the full markers (reference-comparable). Dominated by
-  the deep packed bands; one field per package is the same limit GeoINR has.
-- [ ] **`softLithoID` volume artifact** — out of scope (SOFTUNIT_SPEC §8); the carve's `(N,C)`
-  probs could be exposed at inference for cleaner volume colouring later.
+### Known limitations
+Moved to **GEOINR_INTEGRATION.md §7** (the durable reference): vestigial `iq`, the single global
+`overturn` knob, the deep-band accuracy ceiling, and the `softLithoID` volume artifact.
 
 ### Add your remaining problems / ideas here
-- (drop new items as you find them — this is the Phase-2 agenda)
+- (Phase-2 agenda — drop new items as you find them)

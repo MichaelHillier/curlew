@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Parent-domain onlap</title>
+  <desc id="desc">A cross-section showing defaultDomain parent: the older parent unconformity field defines the basal boundary for the younger depositional package, whose beds onlap and pinch out against that surface.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eef2f7"/>
+    </linearGradient>
+    <linearGradient id="youngerFill" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#dbeafe" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#bae6fd" stop-opacity="0.72"/>
+    </linearGradient>
+    <pattern id="parentHatch" width="18" height="18" patternUnits="userSpaceOnUse" patternTransform="rotate(-32)">
+      <line x1="0" y1="0" x2="0" y2="18" stroke="#0284c7" stroke-width="3" opacity="0.15"/>
+    </pattern>
+    <clipPath id="panelClip">
+      <rect x="76" y="120" width="1048" height="505" rx="18"/>
+    </clipPath>
+    <clipPath id="olderClip">
+      <path d="M80 438 C200 402 270 336 390 326 C540 314 626 391 748 379 C918 362 1008 258 1120 226 L1120 625 L80 625 Z"/>
+    </clipPath>
+    <clipPath id="youngerClip">
+      <path d="M80 120 L1120 120 L1120 226 C1008 258 918 362 748 379 C626 391 540 314 390 326 C270 336 200 402 80 438 Z"/>
+    </clipPath>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#0369a1"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#b45309"/>
+    </marker>
+    <marker id="arrowSlate" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#334155"/>
+    </marker>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.13"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="720" fill="#f8fafc"/>
+  <text x="80" y="58" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="34" font-weight="700" fill="#0f172a">defaultDomain='parent': onlap against an older unconformity</text>
+  <text x="80" y="91" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" fill="#475569">The overprint mask is evaluated on the parent unconformity field, not on the younger package field.</text>
+
+  <g filter="url(#softShadow)">
+    <rect x="76" y="120" width="1048" height="505" rx="18" fill="url(#sky)" stroke="#cbd5e1"/>
+  </g>
+
+  <g clip-path="url(#panelClip)">
+    <rect x="76" y="120" width="1048" height="505" fill="url(#sky)"/>
+
+    <g clip-path="url(#olderClip)">
+      <rect x="76" y="120" width="1048" height="505" fill="#fbf0d9"/>
+      <path d="M-70 605 C102 550 270 558 438 592 C612 628 762 580 940 603 C1072 620 1180 598 1280 568" fill="none" stroke="#fca5a5" stroke-width="42" opacity="0.85"/>
+      <path d="M-70 543 C108 486 273 494 441 532 C612 570 768 523 944 542 C1082 557 1180 535 1280 501" fill="none" stroke="#fde68a" stroke-width="40" opacity="0.92"/>
+      <path d="M-72 486 C103 426 274 438 442 475 C611 514 771 469 943 481 C1076 490 1180 475 1280 440" fill="none" stroke="#86efac" stroke-width="39" opacity="0.91"/>
+      <path d="M-70 427 C116 367 279 383 444 417 C616 453 770 417 944 416 C1078 414 1180 407 1280 375" fill="none" stroke="#c4b5fd" stroke-width="38" opacity="0.88"/>
+      <path d="M-60 360 C130 320 300 324 468 346 C640 370 800 343 972 323 C1102 307 1195 301 1290 274" fill="none" stroke="#7dd3fc" stroke-width="38" opacity="0.88"/>
+      <path d="M-65 510 C105 453 273 463 443 501 C615 539 768 492 943 510 C1079 523 1180 504 1280 472" fill="none" stroke="#b45309" stroke-width="10" opacity="0.42"/>
+      <path d="M-65 574 C104 519 271 527 438 561 C612 597 764 549 940 572 C1071 589 1180 568 1280 539" fill="none" stroke="#0369a1" stroke-width="10" opacity="0.42"/>
+      <path d="M-65 449 C116 389 278 405 444 439 C615 474 771 438 945 439 C1078 437 1180 430 1280 397" fill="none" stroke="#7c3aed" stroke-width="10" opacity="0.4"/>
+    </g>
+
+    <g clip-path="url(#youngerClip)">
+      <rect x="76" y="120" width="1048" height="505" fill="url(#youngerFill)"/>
+      <rect x="76" y="120" width="1048" height="505" fill="url(#parentHatch)"/>
+      <path d="M80 195 C240 202 410 190 560 218 C682 241 748 283 815 331" fill="none" stroke="#0ea5e9" stroke-width="38" opacity="0.7" stroke-linecap="round"/>
+      <path d="M80 254 C236 261 396 246 535 273 C650 296 704 333 753 376" fill="none" stroke="#38bdf8" stroke-width="36" opacity="0.82" stroke-linecap="round"/>
+      <path d="M80 313 C221 318 360 306 480 326 C584 343 635 365 679 389" fill="none" stroke="#7dd3fc" stroke-width="34" opacity="0.8" stroke-linecap="round"/>
+      <path d="M80 374 C189 376 290 366 378 371 C463 376 514 385 560 400" fill="none" stroke="#bae6fd" stroke-width="32" opacity="0.86" stroke-linecap="round"/>
+      <path d="M80 213 C242 219 411 208 558 236 C677 258 742 295 804 339" fill="none" stroke="#0369a1" stroke-width="6" opacity="0.64" stroke-linecap="round"/>
+      <path d="M80 273 C237 279 397 266 532 292 C644 314 698 344 745 380" fill="none" stroke="#0369a1" stroke-width="6" opacity="0.55" stroke-linecap="round"/>
+      <path d="M80 331 C220 336 360 326 479 344 C580 359 631 374 674 393" fill="none" stroke="#0369a1" stroke-width="6" opacity="0.46" stroke-linecap="round"/>
+      <circle cx="815" cy="331" r="6" fill="#0369a1"/>
+      <circle cx="753" cy="376" r="6" fill="#0369a1"/>
+      <circle cx="679" cy="389" r="6" fill="#0369a1"/>
+    </g>
+
+    <path d="M80 438 C200 402 270 336 390 326 C540 314 626 391 748 379 C918 362 1008 258 1120 226" fill="none" stroke="#b45309" stroke-width="8" stroke-linecap="round"/>
+    <path d="M80 438 C200 402 270 336 390 326 C540 314 626 391 748 379 C918 362 1008 258 1120 226" fill="none" stroke="#fef3c7" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <g font-family="Inter, Segoe UI, Arial, sans-serif">
+    <rect x="92" y="144" width="390" height="118" rx="12" fill="#ffffff" fill-opacity="0.94" stroke="#bae6fd"/>
+    <text x="112" y="176" font-size="18" font-weight="700" fill="#0369a1">Domain source</text>
+    <text x="112" y="207" font-size="23" font-family="Consolas, Menlo, monospace" fill="#0f172a">domain = parent field</text>
+    <text x="112" y="236" font-size="16" fill="#475569">The older unconformity supplies the basal mask.</text>
+
+    <rect x="740" y="142" width="348" height="118" rx="12" fill="#ffffff" fill-opacity="0.94" stroke="#fed7aa"/>
+    <text x="760" y="174" font-size="18" font-weight="700" fill="#b45309">Overprint test</text>
+    <text x="760" y="204" font-size="21" font-family="Consolas, Menlo, monospace" fill="#0f172a">w = 1 if f_parent &gt; theta_U</text>
+    <text x="760" y="233" font-size="16" fill="#475569">The younger package is claimed only above U.</text>
+
+    <text x="808" y="416" font-size="19" font-weight="700" fill="#b45309">PARENT unconformity iso U</text>
+    <line x1="804" y1="424" x2="890" y2="350" stroke="#b45309" stroke-width="3" marker-end="url(#arrowAmber)"/>
+
+    <text x="146" y="537" font-size="19" font-weight="700" fill="#334155">Older parent beds</text>
+    <text x="146" y="564" font-size="16" fill="#475569">already truncated by U</text>
+    <line x1="325" y1="526" x2="404" y2="462" stroke="#334155" stroke-width="3" marker-end="url(#arrowSlate)"/>
+
+    <text x="566" y="297" font-size="19" font-weight="700" fill="#0369a1">younger beds onlap</text>
+    <text x="566" y="323" font-size="16" fill="#475569">beds pinch out where they meet the parent iso</text>
+    <line x1="730" y1="326" x2="802" y2="337" stroke="#0369a1" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  </g>
+
+  <g font-family="Inter, Segoe UI, Arial, sans-serif">
+    <rect x="80" y="658" width="1040" height="1" fill="#cbd5e1"/>
+    <text x="80" y="691" font-size="16" fill="#475569">Use for a depositional package built with onlap=True: internal beds belong to the child package, but the base follows the parent unconformity field.</text>
+  </g>
+</svg>

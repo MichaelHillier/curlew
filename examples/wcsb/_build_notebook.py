@@ -170,7 +170,7 @@ the youngest unconformity's field above its iso). Each colour is one event; eros
 events own no lithology (they are surfaces covered by the onlapping package).""")
 code(r"""print("derived events (oldest → youngest):")
 for ev, meta in zip(M.events, M.field_meta):
-    extra = (f"iso between L{min(meta.above_levels)}..{max(meta.above_levels)} / L{meta.eroded_level}"
+    extra = (f"L{','.join(map(str, meta.above_levels))} above unconformity, L{meta.eroded_level} eroded below"
              if meta.is_unconformity else (f"levels={meta.levels}" if meta.levels else ""))
     print(f"  eid={ev.eid:2d}  {meta.kind:11s}  onlap={ev.overprint.defaultDomain:6s}  "
           f"n_iq={meta.n_iq:2d}  {meta.name[:34]:34s}  {extra}")
