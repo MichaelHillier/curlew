@@ -39,3 +39,6 @@ sandbox
 # large prediction/export artifacts (regenerate via the wcsb notebook)
 examples/wcsb/*.vti
 examples/wcsb/*.vts
+
+# generated HTML/WebGL viewer outputs (regenerate via the example notebooks)
+examples/*/outputs/

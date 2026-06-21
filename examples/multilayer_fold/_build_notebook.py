@@ -240,15 +240,21 @@ plt.title("multilayer_fold — training loss"); plt.grid(True, alpha=0.3)
 plt.tight_layout(); plt.show()""")
 
 # ---------------------------------------------------------------- 5. predict / 3D
-md(r"""## 5. Predict & 3D view (napari)
+md(r"""## 5. Predict & 3D view (WebGL HTML viewer)
 
-Evaluate the fitted model on a regular grid → `Geode`, then open a **napari** 3D
-view: the scalar-field volume, the predicted **units** (lithology IDs) and one
-extracted **iso-surface mesh per contact**. Following the idiomatic curlew pattern,
-the scalar volume and the surfaces are pushed as **separate layers** (`addVolume` +
-per-contact `G.contour` → `addMesh`). `SHOW_NAPARI` is on by default. A matplotlib
-cross-section follows as a static fallback so the notebook still renders without a
-live Qt session.""")
+Evaluate the fitted model on a regular grid → `Geode`, then build a **self-contained
+WebGL HTML viewer** (`curlew.visualise.html_viewer`) and open it in the browser. The
+viewer renders the predicted **lithology volume** (boundary faces between units), one
+extracted **iso-surface mesh per contact** (`G.contour`), the **interface observation
+points**, and the **bedding normals** as toggleable vectors — all sharing one
+unit-visibility mask, palette, vertical-exaggeration and X/Y/Z slicer. The point and
+normal layers are derived straight from the `Observations` object by
+`write_geomodel_viewer(obs=...)`. This model is small, so the *self-contained* mode embeds
+all geometry into a single `.html` (no server needed; opens straight from `file://`).
+
+The file is written into `outputs/` (git-ignored). `OPEN_BROWSER` is on by default; set
+it `False` for headless/CI runs. A matplotlib cross-section follows as a static fallback
+so the notebook still renders something in a non-interactive context.""")
 code(r"""from curlew.geometry import Grid
 lo, hi = obs.bounds()
 lo = np.asarray(lo, float); hi = np.asarray(hi, float)
@@ -259,55 +265,18 @@ geode = M.predict(G)
 print("grid shape:", geode.grid.shape, "| scalar range:",
       float(np.nanmin(geode.scalar)), "→", float(np.nanmax(geode.scalar)))""")
 
-code(r"""SHOW_NAPARI = True   # set False to skip opening the napari window
-if SHOW_NAPARI:
-    from curlew.visualise.napari_viewer import NapariViewer
-    nv = NapariViewer(title="multilayer_fold", ndisplay=3)
+code(r"""from pathlib import Path
+from curlew.visualise.html_viewer import write_geomodel_viewer, serve_and_open
 
-    # one colour per contact, shared by its iso-surface mesh AND its interface points
-    contacts_ord = sorted(M.field_meta[0].contacts, key=lambda c: c.unit_index, reverse=True)
-    nC = len(contacts_ord)
-    contact_color = {c.name: np.asarray(curlew.ccramp(i / max(nC - 1, 1)))
-                     for i, c in enumerate(contacts_ord)}
+OUT = Path("outputs"); OUT.mkdir(exist_ok=True)
 
-    # (1) scalar-field volume. 'attenuated_mip' renders a smooth field and avoids
-    # the napari hover bug that 'translucent'/'iso' can trigger when the cursor ray
-    # misses the volume (a harmless IndexError in the status bar).
-    nv.addVolume("scalar", G.reshape(geode.scalar), grid=G,
-                 rendering="attenuated_mip", colormap=curlew.ccstrat)
-
-    # (2) predicted units (lithology IDs) as an additive volume
-    nv.addVolume("units", G.reshape(geode.lithoID.astype(float)), grid=G,
-                 rendering="additive", blending="additive",
-                 colormap=curlew.ccstrat, opacity=0.4)
-
-    # (3) one iso-surface mesh per contact — extracted with G.contour, pushed via
-    # addMesh (the idiomatic curlew pattern: scalar + meshes added as separate layers).
-    for e in M.events:
-        if e.overprint is None:
-            continue
-        mask = geode.structureID == e.eid          # restrict to this event's region
-        for name, iso in e.getIsovalues().items():
-            verts, faces = G.contour(geode.fields[e.name], iso=iso, mask=mask, erodeMask=-4)
-            nv.addMesh(name, verts=verts, faces=faces, rgb=contact_color[name])
-
-    # (4) interface (contact) points — coloured to match each contact's surface
-    for c in contacts_ord:
-        p = obs.coords[obs.is_interface & (obs.level == c.level)]
-        nv.addPoints(f"pts_{c.name}", p, rgb=np.tile(contact_color[c.name], (len(p), 1)),
-                     size=6.0, border_color="black")
-
-    # (5) bedding normals (the gv gradient constraints) as vectors
-    nco, nvec, _ = obs.normal_points()
-    nvec_u = nvec / np.linalg.norm(nvec, axis=1, keepdims=True)
-    nv.addVectors("normals", origins=nco, directions=nvec_u, rgb="crimson",
-                  length=0.10 * float(np.max(hi - lo)), width=1.5)
-
-    nv.show()
-    # If the window is not responsive in VS Code / Jupyter, enable the Qt event loop
-    # once per session with the `%gui qt` line magic (or call `napari.run()`).
-    print(f"napari viewer: 'scalar' + 'units' volumes, {nC} contact iso-surfaces, "
-          f"interface points (pts_*) and bedding normals.")""")
+html = write_geomodel_viewer(
+    OUT / "multilayer_fold_viewer.html", M, geode, G,
+    obs=obs, color_by="lithoID", erode_mask=-4,
+    mode="self_contained", title="multilayer_fold", initial_z_exaggeration=1,
+)
+print("wrote", html)
+serve_and_open(html)   # opens the .html directly in the default browser (file://)""")
 
 code(r"""# static matplotlib cross-section (y–z plane at mid-x), with contact iso-contours
 ny = nz = 160

@@ -307,18 +307,23 @@ fig.suptitle(f"per-field scalar fields ({FIELD}) — black = estimated iso-surfa
 plt.tight_layout(); plt.show()""")
 
 # ---------------------------------------------------------------- 6. combined / 3D
-md(r"""## 6. Combined model — predict & 3D view
+md(r"""## 6. Combined model — predict & 3D view (WebGL HTML viewer)
 
 `M.predict` assembles all fields via the onlap/truncation combine. The matplotlib
-section shows the combined scalar + lithology; the optional napari view shows the
-lithology/structure volumes, the **observation points** (coloured by their true unit so
-you can judge the fit directly), and the extracted surfaces. Comparing this with §5 shows
-where the **combine** (not the individual fields) places unit boundaries.
+section shows the combined scalar + lithology; the **WebGL HTML viewer** (built below)
+shows the lithology volume (coloured by stratigraphic **level**), the **observation
+points** (coloured by their true unit so you can judge the fit directly), and the
+extracted iso-surfaces — all sharing one unit-visibility mask, palette and X/Y/Z slicer.
+Comparing this with §5 shows where the **combine** (not the individual fields) places unit
+boundaries.
 
 The predict grid is **high-resolution** (5 km horizontal, 20 m vertical — `predict`
-chunks it by `curlew.batchSize`), and the napari viewer applies a **vertical
-exaggeration** (the basin is ~300× wider than it is deep) so the layering is visible
-rather than squashed onto one plane.""")
+chunks it by `curlew.batchSize`), so the model is large: the viewer is built in **tiled**
+mode (a small `.html` plus a binary tile folder served over local HTTP via
+`serve_and_open`). The viewer's *Vertical exag.* slider (initialised to ~100×, since the
+basin is ~300× wider than it is deep) makes the thin layering visible rather than squashed
+onto one plane. Outputs go to `outputs/` (git-ignored); set `OPEN_BROWSER=False` for
+headless runs.""")
 code(r"""from curlew.geometry import Grid
 RES_XY, RES_Z = 5000.0, 20.0
 curlew.batchSize = 50000       # predict is chunked by this; lower if you hit GPU OOM, raise for speed
@@ -337,52 +342,18 @@ pcm2 = ax[1].pcolormesh(xs, zs, sec.lithoID.reshape(nz, nx), shading="auto", cma
 fig.colorbar(pcm2, ax=ax[1]); ax[1].set_title("lithology ID (combined)")
 for a in ax: a.set_xlabel("x"); a.set_ylabel("z")
 plt.tight_layout(); plt.show()""")
-code(r"""SHOW_NAPARI = True
-if SHOW_NAPARI:
-    from curlew.visualise.napari_viewer import NapariViewer
-    from matplotlib.colors import Normalize
+code(r"""from pathlib import Path
+from curlew.visualise.html_viewer import write_geomodel_viewer, serve_and_open
 
-    # vertical_exaggeration stretches z on every layer (the basin is ~300x wider than deep)
-    nv = NapariViewer(title=f"wcsb ({FIELD})", ndisplay=3, vertical_exaggeration=100.0)
+OUT = Path("outputs"); OUT.mkdir(exist_ok=True)
 
-    # lithology / structure volumes (pin contrast limits so the points below colour-match)
-    idmin, idmax = float(geode.lithoID.min()), float(geode.lithoID.max())
-    nv.addVolume("lithology", G.reshape(geode.lithoID.astype(float)), grid=G,
-                 rendering="attenuated_mip", colormap=curlew.ccstrat,
-                 contrast_limits=(idmin, idmax))
-    nv.addVolume("structure", G.reshape(geode.structureID.astype(float)), grid=G,
-                 rendering="additive", blending="additive", colormap=curlew.ccstrat, opacity=0.35)
-
-    # --- observation points: the data the model was fit to -------------------------------
-    # Coloured by their TRUE unit lithology with the SAME colormap + contrast limits as the
-    # lithology volume, so a well-fit model shows each point sitting in volume of the same
-    # colour (mismatched colours flag where the model misfits the data). Subsampled for
-    # responsiveness — raise N_SHOW to plot more; adjust `size` (world metres) to taste.
-    N_SHOW = 150000
-    rng = np.random.default_rng(0)
-    pidx = rng.choice(len(obs.coords), size=min(N_SHOW, len(obs.coords)), replace=False)
-    Pworld = obs.coords[pidx].astype(float)
-    true_id = np.array([M.llookup.get(M.level_litho.get(int(L)), 0) for L in obs.level[pidx]], float)
-    pt_rgba = curlew.ccstrat(Normalize(vmin=idmin, vmax=idmax)(true_id))
-    nv.addPoints("observations (true unit)", Pworld, rgb=pt_rgba,
-                 size=3 * RES_XY, border_color="black")
-
-    # per-event estimated iso-surfaces
-    nC = sum(len(e.isosurfaces) for e in M.events) or 1; j = 0
-    for e in M.events:
-        if not e.isosurfaces: continue
-        mask = geode.structureID == e.eid
-        if mask.sum() == 0: continue
-        for name, iso in e.getIsovalues().items():
-            try:
-                verts, faces = G.contour(geode.fields[e.name], iso=iso, mask=mask, erodeMask=-2)
-                if len(verts): nv.addMesh(f"{e.name[:18]}:{name[:14]}", verts=verts, faces=faces,
-                                          rgb=np.asarray(curlew.ccramp(j / nC)))
-            except Exception as exc:
-                print("skip", e.name, name, exc)
-            j += 1
-    nv.show()
-    print("napari: lithology + structure volumes + observation points + per-event iso-surfaces")""")
+html = write_geomodel_viewer(
+    OUT / "wcsb_viewer.html", M, geode, G,
+    obs=obs, color_by="level", mode="tiled", max_points=200000,
+    title=f"wcsb ({FIELD})", initial_z_exaggeration=100,
+)
+print("wrote", html)
+serve_and_open(html)""")
 md(r"""### Export for ParaView
 
 Write the predicted volume to a VTK file for detailed inspection (`curlew.io.saveVTK`;
@@ -396,9 +367,10 @@ are written:
   oldest→youngest with gaps for surface-only events). The id→name legend is embedded as
   the `lithoID_legend` field-data array (Spreadsheet view → Field Data) and printed below.
 
-Note the napari colormap (`curlew.ccstrat`) is a deliberately *shuffled* ramp (so thin
-adjacent bands stay distinguishable) — apparent out-of-sequence colours in napari are
-not evidence of out-of-sequence units; check `level` here instead.""")
+Note that the categorical palettes (here in ParaView, or in the HTML viewer's *Stratigraphy*
+/ *High contrast* options) deliberately cycle/shuffle hues so thin adjacent bands stay
+distinguishable — apparent out-of-sequence colours are **not** evidence of out-of-sequence
+units; check the `level` array here (or the HTML viewer's per-unit legend) instead.""")
 code(r"""from curlew.io import saveVTK
 VTK_PATH = "wcsb_prediction.vti"
 
