@@ -130,6 +130,11 @@ class CarveSpec:
         Learnable-iso plan: ``('free', iso_id)`` for an erosional unconformity, or
         ``('package', event_name, m, levels)`` for a depositional package's
         ``θ_0`` + ``φ`` reparam.
+    seed_map : dict[str, tuple]
+        Maps each carve iso-id to ``(event_name, iso_name)`` — the event and the
+        isosurface (seed) on it that supplies the threshold. Used by the **seed-iso**
+        path (skmb), where iso-values are read from interface-seeded isosurfaces each
+        step instead of from the learnable ``iso_plan``.
     """
 
     ops: list
@@ -137,6 +142,7 @@ class CarveSpec:
     level_to_class: dict
     class_levels: list
     iso_plan: list
+    seed_map: dict = _dcfield(default_factory=dict)
 
 
 def build_class_index(model):
@@ -176,12 +182,23 @@ def build_carve_spec(model) -> CarveSpec:
     CarveSpec
     """
     level_to_class, class_levels = build_class_index(model)
-    ops, iso_plan = [], []
+    ops, iso_plan, seed_map = [], [], {}
     last_unconf_name = None
     last_unconf_iso = None
 
     for meta in model.field_meta:
         ev = model[meta.name]
+        # seed map: every iso-id → the event + isosurface (seed) that supplies its value,
+        # restricted to surfaces actually present (seeded) on the event.
+        seeded = ev.isosurfaces
+        if meta.is_unconformity and meta.iso_name in seeded:
+            seed_map[f"{meta.name}::unconf"] = (meta.name, meta.iso_name)
+        elif meta.kind == "depositional":
+            for j, contact in enumerate(meta.contacts):
+                if contact.name in seeded:
+                    seed_map[f"{meta.name}::c{j}"] = (meta.name, contact.name)
+            if meta.top_iso is not None and meta.top_iso in seeded:
+                seed_map[f"{meta.name}::top"] = (meta.name, meta.top_iso)
         if meta.is_unconformity:
             # An erosional unconformity owns NO class and is NOT a carve op: its
             # truncation is applied exactly once by the class-owning event that onlaps
@@ -200,8 +217,14 @@ def build_carve_spec(model) -> CarveSpec:
             contact_isos = [f"{meta.name}::c{j}" for j in range(m)]
             if m > 0:
                 iso_plan.append(("package", meta.name, m, levels))
+            # a baselap-onto-conformal package onlaps the *top of the package below* (its
+            # recorded onlap target); otherwise the nearest older unconformity.
+            if getattr(meta, "onlap_package", False) and meta.onlap_event is not None:
+                weight_event, weight_iso = meta.onlap_event, meta.onlap_iso_id
+            else:
+                weight_event, weight_iso = last_unconf_name, last_unconf_iso
             ops.append(_CarveOp(
-                kind="depositional", weight_event=last_unconf_name, weight_iso=last_unconf_iso,
+                kind="depositional", weight_event=weight_event, weight_iso=weight_iso,
                 band_event=meta.name, band_classes=classes, contact_isos=contact_isos,
             ))
         else:  # region-only (basement / dropped top unit)
@@ -219,7 +242,7 @@ def build_carve_spec(model) -> CarveSpec:
     ops.reverse()  # youngest → oldest (stick-break order)
     return CarveSpec(ops=ops, n_classes=len(class_levels),
                      level_to_class=level_to_class, class_levels=class_levels,
-                     iso_plan=iso_plan)
+                     iso_plan=iso_plan, seed_map=seed_map)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +332,11 @@ def soft_unit_probs(model, x, iso_values: dict, tau: float, carve_spec: CarveSpe
         remaining = remaining * (1.0 - w)
 
     # every op owns ≥1 class and no mass is discarded, so the sum is already ~1; the
-    # clamp/divide only guards float drift (no degenerate renormalisation pressure).
+    # clamp/divide only guards float drift (no degenerate renormalisation pressure). The
+    # ``clamp_min(0)`` is a no-op for the learnable path (the monotone reparam keeps the
+    # band differences non-negative) and guards the seed-iso path, where data-seeded
+    # contacts are not reparam-ordered and a rare local inversion could dip a band <0.
+    probs = probs.clamp_min(0.0)
     return probs / probs.sum(dim=1, keepdim=True).clamp_min(EPS)
 
 
@@ -370,12 +397,13 @@ class UnitLoss(LearnableBase):
     """
 
     def __init__(self, model, *, tau: float = 0.05, points_per_level: int = 1024,
-                 iso_lr: float = None, weight: float = 1.0, name: str = "unit"):
+                 iso_lr: float = None, weight: float = 1.0, seed_isos: bool = False,
+                 name: str = "unit"):
         """
         Parameters
         ----------
         model : curlew.geology.geomodel.GeoModel
-            A model built by the unit-only path (``field_meta`` / ``level_points`` set).
+            A model built by the chain path (``field_meta`` / ``level_points`` set).
         tau : float, optional
             Soft-unit temperature; sharpness ``s = 1/τ`` (default 0.05 ⇒ ``s = 20``,
             matching GeoINR). Fixed (no annealing in v1).
@@ -383,15 +411,20 @@ class UnitLoss(LearnableBase):
             Points sampled per level each epoch (balanced sampling, default 1024).
         iso_lr : float, optional
             Learning rate for the iso-value optimiser. Defaults to ~10× a coupled
-            field's learning rate (GeoINR convention).
+            field's learning rate (GeoINR convention). Unused when ``seed_isos=True``.
         weight : float, optional
             Weight on the NLL term (default 1.0).
+        seed_isos : bool, optional
+            When ``True`` the carve reads each iso-value from its interface-**seeded**
+            isosurface (re-evaluated each step, grad-carrying) instead of owning learnable
+            iso parameters — the hybrid path (skmb), where on-contact points pin the
+            surfaces directly. Requires every carve threshold to be seeded on its event.
         name : str, optional
             Loss group name (default ``"unit"``).
         """
         super().__init__()
         assert getattr(model, "level_points", None) is not None, (
-            "UnitLoss requires a model built by build_geomodel's unit-only path "
+            "UnitLoss requires a model built by build_geomodel's chain path "
             "(model.level_points missing)."
         )
         self.name = name
@@ -400,6 +433,7 @@ class UnitLoss(LearnableBase):
             raise ValueError("tau must be > 0")
         self.points_per_level = int(points_per_level)
         self.weight = float(weight)
+        self.seed_isos = bool(seed_isos)
 
         # carve recipe + class index (SOFTUNIT_SPEC §3)
         self.spec = build_carve_spec(model)
@@ -409,38 +443,73 @@ class UnitLoss(LearnableBase):
         self._params = nn.ParameterList()
         self._free_iso = {}   # iso_id -> param index
         self._pkg = {}        # event name -> (theta0_idx, phi_idx, [contact_ids])
-        free_init, pkg_init = iso_init_values(model, self.spec)
-        for entry in self.spec.iso_plan:
-            if entry[0] == "free":
-                _, iso_id = entry
-                self._params.append(nn.Parameter(_tensor(float(free_init[iso_id]))))
-                self._free_iso[iso_id] = len(self._params) - 1
-            else:  # ('package', name, m, levels)
-                _, ename, m, _levels = entry
-                theta0, gaps = pkg_init[ename]
-                self._params.append(nn.Parameter(_tensor(float(theta0))))
-                t0_idx = len(self._params) - 1
-                self._params.append(nn.Parameter(_tensor(_inv_softplus(gaps))))
-                phi_idx = len(self._params) - 1
-                self._pkg[ename] = (t0_idx, phi_idx, [f"{ename}::c{j}" for j in range(m)])
+        if not self.seed_isos:
+            free_init, pkg_init = iso_init_values(model, self.spec)
+            for entry in self.spec.iso_plan:
+                if entry[0] == "free":
+                    _, iso_id = entry
+                    self._params.append(nn.Parameter(_tensor(float(free_init[iso_id]))))
+                    self._free_iso[iso_id] = len(self._params) - 1
+                else:  # ('package', name, m, levels)
+                    _, ename, m, _levels = entry
+                    theta0, gaps = pkg_init[ename]
+                    self._params.append(nn.Parameter(_tensor(float(theta0))))
+                    t0_idx = len(self._params) - 1
+                    self._params.append(nn.Parameter(_tensor(_inv_softplus(gaps))))
+                    phi_idx = len(self._params) - 1
+                    self._pkg[ename] = (t0_idx, phi_idx, [f"{ename}::c{j}" for j in range(m)])
+        else:
+            self._require_seedable(model)
 
         # balanced per-class pools (model coords) + labels (SOFTUNIT_SPEC §4)
         self._init_pools(model)
 
-        # iso-value optimiser (iso_lr ≈ 10× field lr per GeoINR)
-        if iso_lr is None:
-            iso_lr = self._default_iso_lr(model)
-        self.init_optim(lr=iso_lr)
+        # iso-value optimiser (iso_lr ≈ 10× field lr per GeoINR). The seed-iso path owns
+        # no iso parameters — the fields (optimised via their own eq / overturn terms)
+        # carry the carve's gradient, so no extra optimiser is needed.
+        if self.seed_isos:
+            self.optim = None
+        else:
+            if iso_lr is None:
+                iso_lr = self._default_iso_lr(model)
+            self.init_optim(lr=iso_lr)
+
+    def _require_seedable(self, model):
+        """Validate (seed-iso path) that every carve threshold has a seeded isosurface."""
+        needed = set()
+        for op in self.spec.ops:
+            if op.weight_iso is not None:
+                needed.add(op.weight_iso)
+            needed.update(op.contact_isos)
+        missing = sorted(needed - set(self.spec.seed_map))
+        assert not missing, (
+            "seed_isos=True needs every carve threshold seeded from interface points, "
+            f"but these have none: {missing}. Provide on-contact (interface) observations "
+            "for the corresponding levels, or use the learnable path (seed_isos=False)."
+        )
 
     # -- iso resolution --------------------------------------------------------
-    def resolve_isos(self) -> dict:
+    def resolve_isos(self, model=None) -> dict:
         """
         Resolve every iso-id to a (grad-carrying) scalar threshold tensor.
 
-        Free (unconformity) isos return their Parameter directly; a package's contacts
-        are computed via the monotone reparam :func:`monotone_contacts`, so they always
-        descend and carry gradient to ``θ_0`` and ``φ``.
+        Learnable path: free (unconformity) isos return their Parameter directly; a
+        package's contacts are computed via the monotone reparam
+        :func:`monotone_contacts`, so they always descend and carry gradient to ``θ_0``
+        and ``φ``. Seed-iso path: each threshold is the mean of its event's field over the
+        isosurface's seed (interface) points — pinned to the data, grad-carrying through
+        the field (``model`` is required).
         """
+        if self.seed_isos:
+            assert model is not None, "resolve_isos(model) requires the model on the seed-iso path."
+            out = {}
+            for iso_id, (ename, iname) in self.spec.seed_map.items():
+                ev = model[ename]
+                _fld, seed = ev.isosurfaces[iname]
+                g = ev.predict(_tensor(np.asarray(seed, float)), combine=False, transform=True,
+                               to_numpy=False, litho=False, props=False, isosurfaces=False)
+                out[iso_id] = g.scalar.reshape(-1).mean()
+            return out
         out = {iso_id: self._params[idx] for iso_id, idx in self._free_iso.items()}
         for _name, (t0_idx, phi_idx, contact_ids) in self._pkg.items():
             contacts = monotone_contacts(self._params[t0_idx], self._params[phi_idx])
@@ -504,7 +573,7 @@ class UnitLoss(LearnableBase):
         co-trains the fields and the iso-values.
         """
         coords, labels = self.sample_balanced_unit_indices()
-        iso_values = self.resolve_isos()
+        iso_values = self.resolve_isos(model)
         probs = soft_unit_probs(model, coords, iso_values, self.tau, self.spec)
         nll = F.nll_loss(probs.clamp_min(EPS).log(), labels)
 
@@ -525,11 +594,18 @@ class UnitLoss(LearnableBase):
         of the post-hoc medians, so the carve's assembly and predict's hard assembly use
         the *same* thresholds (the §7 soft-vs-hard cross-check).
 
+        On the **seed-iso** path nothing is written — the surfaces are already seeded on
+        the events from the interface points, so ``GeoModel.predict`` resolves them
+        directly; the resolved (current) iso-values are returned for inspection only.
+
         Returns
         -------
         dict
             Maps each isosurface lithology key (``"<event>_<iso name>"``) to its value.
         """
+        if self.seed_isos:
+            return {iso_id: float(v.detach().cpu())
+                    for iso_id, v in self.resolve_isos(model).items()}
         iso_values = {k: float(v.detach().cpu()) for k, v in self.resolve_isos().items()}
         out = {}
         for meta in model.field_meta:

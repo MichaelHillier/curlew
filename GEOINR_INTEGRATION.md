@@ -5,7 +5,7 @@ A readable, illustrated walkthrough of the runtime behaviour. For the *decisions
 for *current status & open items* see [SOFTUNIT_STATUS.md](SOFTUNIT_STATUS.md).
 
 The integration turns a **stratigraphic column + point observations** into a fitted
-Curlew `GeoModel`, using GeoINR's neural fields and (for unit-only data like wcsb) GeoINR's
+Curlew `GeoModel`, using GeoINR's neural fields and (for unit data) GeoINR's
 **unit / NLL coupling**, but reusing Curlew's native event graph, constraints and `predict`.
 
 ```
@@ -15,7 +15,8 @@ strat_col.csv + observations
    GeoModel  =  graph of GeoEvents (oldest → youngest)
         │  fit
         ├── on-surface data  → per-field eq/iq/grad losses        (multilayer_fold)
-        └── unit-only data   → attach_unit_loss() joint CE        (wcsb)
+        ├── unit-only data   → attach_unit_loss() joint CE        (wcsb)
+        └── interface+unit   → attach_unit_loss(seed_isos=True)   (skmb)
         ▼  predict  (sequential overprint combine — unchanged Curlew machinery)
    Geode  (scalar, lithoID, structureID, surfaces, …)
 ```
@@ -28,7 +29,8 @@ strat_col.csv + observations
 | Strat-column → event-chain builder | [curlew/geology/stratbuilder.py](curlew/geology/stratbuilder.py) |
 | Unit / NLL coupling (carve, `UnitLoss`) | [curlew/geology/softunit.py](curlew/geology/softunit.py) |
 | Event, overprint, combine (Curlew core — untouched) | [geoevent.py](curlew/geology/geoevent.py), [interactions.py](curlew/geology/interactions.py), [core.py](curlew/core.py) |
-| wcsb notebook | [examples/wcsb/_build_notebook.py](examples/wcsb/_build_notebook.py) |
+| wcsb notebook (unit-only, learnable isos) | [examples/wcsb/_build_notebook.py](examples/wcsb/_build_notebook.py) |
+| skmb notebook (interface+unit, seeded isos, baselap-onto-conformal) | [examples/skmb/_build_notebook.py](examples/skmb/_build_notebook.py) |
 
 ---
 
@@ -92,10 +94,21 @@ In the builder ([`strati(..., onlap=True)`](curlew/geology/__init__.py)):
 |---|---|---|---|
 | erosional unconformity | `above` | `child` | its **own** field |
 | depositional package (onlaps the unconformity below it) | `above` | `parent` | the **unconformity** field below it |
+| depositional package (**baselap onto conformal package**, skmb) | `above` | `parent` | the **lower package's top** isosurface |
 | region-only basement (oldest) | `above`, `base=-inf` | `child` | — (claims everything below) |
 | region-only top (onlaps youngest unconformity) | `above` | `parent` | the youngest **unconformity** field |
 
 This table *is* the rule the carve (§5) and `predict` both follow.
+
+**Baselap onto a conformal package (skmb).** When a `baselap` unit is followed (older) by a
+`conformal` unit, it sits at the **base of an upper package** that laps onto the **top of the
+conformal package below** — not an unconformity. `derive_scalar_fields` splits the run at the
+baselap (`_package_end`); the lower package is given a **top isosurface** (seeded from its
+youngest contact's interface points), and the upper package onlaps it with the *same*
+`parent`-domain mechanism above (just a depositional top instead of an unconformity). In skmb
+this is the Westgate→Viking, Torquay→Birdbear, 1stRedBed→DawsonBay and Winnipegosis→Ashern
+relationships. wcsb has no such case (every wcsb baselap is followed by `eroded`), so its
+partition is unchanged.
 
 ---
 
@@ -122,6 +135,15 @@ Why an alias and not the same object?
 Valid because the region-only event is stratigraphically adjacent to its target with no
 deformation between them, so their reference frames coincide. (This is why a region-only
 event shows **no constraints / no loss** when you inspect it — that's by design.)
+
+**Doubled unconformities (skmb).** When two `eroded` units are adjacent in the column (e.g.
+Sub_Success then Sub_Cantuar), the rock of the **older** one is preserved as a thin unit
+*sandwiched between the two unconformity surfaces*. It gets its **own region-only event** that
+**onlaps the older unconformity** below it and is **truncated by the younger** one above it, so
+it fills the `[older-iso, younger-iso]` band. Without it that band is claimed by no event — a
+**void** in `predict` (the older unconformity truncates everything above its iso, but the next
+onlapping package only fills above the *younger* iso). Its field aliases the older
+unconformity's, exactly like the basement/top regions.
 
 ---
 
@@ -221,6 +243,43 @@ Iso-values are **learnable Parameters owned by `UnitLoss`**, not scattered throu
 After `M.fit(custom_loss=[uloss])`, `uloss.write_isosurfaces(M)` pushes the learned values
 into ordinary `addIsosurface(value=...)`, **oldest-contact-first** (so ascending `lithoID`
 = younger), and `predict` works as usual. **`estimate_isosurfaces` is not used on this path.**
+
+### Iso-values: seeded from interfaces (skmb, `seed_isos=True`)
+
+When the observations include **on-contact (interface) points** as well as unit points
+(skmb), the iso-values are **not learned** — they are read directly from the data. Each
+surface (every conformal contact, every package top, every unconformity) gets an `eq` trace
++ a **seed isosurface** from its interface points at build time; the field's `eq_norm` loss
+pins it there. `attach_unit_loss(M, seed_isos=True)` then builds a `UnitLoss` that owns **no
+iso parameters**: its carve reads each threshold as the field's value over that surface's seed
+points each step (`resolve_isos(model)`, grad-carrying through the field), so the unit points
+still drive the cross-entropy but the contacts stay pinned to the interface data. Nothing is
+written post-fit — the seeds resolve directly at `predict` (no `write_isosurfaces` /
+`estimate_isosurfaces`). The monotone reparam is unnecessary (the data orders the contacts);
+`soft_unit_probs` `clamp_min(0)`s the bands as a cheap guard against a rare local inversion.
+
+**Surface ordering.** On this path `attach_unit_loss` keeps `iq_norm_weight` **on for every
+field** — the gradient-normalised inequalities *order the surfaces* where the CE is silent (the
+CE only constrains unit points; the surfaces, defined by interface points, carry no CE signal,
+and their deep/margin regions are unit-sparse). Two kinds:
+
+- **within a package** — a younger contact's on-surface points sit `>` the next-older contact's
+  (in that package's field), so the seeded contacts keep stratigraphic order and cannot cross;
+- **across unconformities (nesting)** — each unconformity's own surface points sit `>` every
+  *older* unconformity's surface points (in its field), **one pair per older surface** so each
+  (e.g. the Precambrian, whose margin points are sparse) gets a full sample draw rather than a
+  fraction of one pooled set. This keeps the older surfaces below a younger iso, so a younger
+  unconformity cannot erode below an older one;
+- **package tops (nesting)** — a **baselap-onto-conformal** package onlaps the *lower package's
+  top iso* (§2), so that top surface is an onlap threshold too. Each package's top contact
+  therefore also nests `>` every older unconformity surface — otherwise the lower package's
+  field floats above its top iso at the basin margin and the upper baselap package reaches down
+  and erodes below an older surface (measured on skmb: the baselap packages were the dominant
+  cause of margin Precambrian-cutting; adding this drops it ~8×).
+
+The `eq` loss pins each surface to its data; these `iq` terms keep the surfaces ordered where
+the data is silent; `overturn` keeps each field monotone in between. The hinge is zero once
+satisfied, so it does not fight the `eq`/CE fit — it only corrects ordering violations.
 
 ---
 

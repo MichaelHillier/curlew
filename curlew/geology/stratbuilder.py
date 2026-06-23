@@ -90,6 +90,12 @@ class ScalarFieldRow:
     A derived scalar field: a package of one or more units sharing one implicit
     function. ``kind`` is ``"depositional"`` or ``"erosional"``;
     ``horizon_unit_indices`` are the units whose base contact this field carries.
+
+    ``onlap_package`` is ``True`` when the package's **base** unit is a ``baselap``
+    sitting on a *conformal* (depositional) package rather than an unconformity — the
+    "baselap-onto-conformal" pattern. Such a package onlaps the **top of the package
+    directly below it** instead of an erosional unconformity (see
+    :func:`_build_unit_only_chain`).
     """
 
     field_index: int
@@ -97,6 +103,7 @@ class ScalarFieldRow:
     kind: str
     unit_indices: list
     horizon_unit_indices: list
+    onlap_package: bool = False
 
     @property
     def feature_count(self) -> int:
@@ -193,7 +200,8 @@ def derive_horizons(units: list) -> list:
     return horizons
 
 
-def _append_scalar_field(fields, *, kind, unit_indices, horizon_unit_indices):
+def _append_scalar_field(fields, *, kind, unit_indices, horizon_unit_indices,
+                         onlap_package=False):
     idx = len(fields)
     fields.append(
         ScalarFieldRow(
@@ -202,8 +210,36 @@ def _append_scalar_field(fields, *, kind, unit_indices, horizon_unit_indices):
             kind=kind,
             unit_indices=list(unit_indices),
             horizon_unit_indices=list(horizon_unit_indices),
+            onlap_package=bool(onlap_package),
         )
     )
+
+
+def _package_end(units, start, n_units) -> int:
+    """
+    Last unit index of the depositional package beginning at ``start`` (youngest-first).
+
+    A package extends to older units until either the **next** unit is ``eroded`` (the
+    unconformity bounds it from below, exclusive) or the **current** unit is ``baselap``
+    (a baselap unit is the *base* of its package, inclusive). The latter is what splits a
+    "baselap-onto-conformal" run into two packages — the baselap unit ends the upper one,
+    and the next older unit starts the lower one.
+    """
+    end = start
+    while (end + 1 < n_units and units[end + 1].relation != "eroded"
+           and units[end].relation != "baselap"):
+        end += 1
+    return end
+
+
+def _onlaps_package(units, end, n_units) -> bool:
+    """
+    True when the package whose base (oldest unit) is ``units[end]`` baselaps onto a
+    *conformal* package below it: its base is ``baselap`` and the next older unit is
+    depositional (``conformal``/``baselap``), not an unconformity.
+    """
+    return (units[end].relation == "baselap" and end + 1 < n_units
+            and units[end + 1].relation in STRATIGRAPHIC_RELATIONS)
 
 
 def derive_scalar_fields(units: list) -> list:
@@ -225,9 +261,7 @@ def derive_scalar_fields(units: list) -> list:
 
     i = 0
     if units[0].relation == "conformal":
-        end = 0
-        while end + 1 < n_units and units[end + 1].relation != "eroded":
-            end += 1
+        end = _package_end(units, 0, n_units)
         horizon_unit_indices = [
             idx for idx in range(1, end + 1) if units[idx].relation in STRATIGRAPHIC_RELATIONS
         ]
@@ -236,6 +270,7 @@ def derive_scalar_fields(units: list) -> list:
                 fields, kind="depositional",
                 unit_indices=list(range(0, end + 1)),
                 horizon_unit_indices=horizon_unit_indices,
+                onlap_package=_onlaps_package(units, end, n_units),
             )
         i = end + 1
     elif units[0].relation == "baselap":
@@ -256,9 +291,7 @@ def derive_scalar_fields(units: list) -> list:
             if attach_unit_to_erosion:
                 i += 1
                 continue
-            end = i
-            while end + 1 < n_units and units[end + 1].relation != "eroded":
-                end += 1
+            end = _package_end(units, i, n_units)
             package_horizon_unit_indices = [
                 idx for idx in range(i + 1, end + 1) if units[idx].relation in STRATIGRAPHIC_RELATIONS
             ]
@@ -267,13 +300,12 @@ def derive_scalar_fields(units: list) -> list:
                     fields, kind="depositional",
                     unit_indices=list(range(i, end + 1)),
                     horizon_unit_indices=package_horizon_unit_indices,
+                    onlap_package=_onlaps_package(units, end, n_units),
                 )
             i = end + 1
             continue
 
-        end = i
-        while end + 1 < n_units and units[end + 1].relation != "eroded":
-            end += 1
+        end = _package_end(units, i, n_units)
         package_horizon_unit_indices = [
             idx for idx in range(i + 1, end + 1) if units[idx].relation in STRATIGRAPHIC_RELATIONS
         ]
@@ -282,6 +314,7 @@ def derive_scalar_fields(units: list) -> list:
                 fields, kind="depositional",
                 unit_indices=list(range(i, end + 1)),
                 horizon_unit_indices=package_horizon_unit_indices,
+                onlap_package=_onlaps_package(units, end, n_units),
             )
         i = end + 1
 
@@ -356,6 +389,12 @@ class _FieldMeta:
     # level (depositional adjacent-band pairs) or a tuple of levels (erosional events
     # pool the onlapping package's levels into one above-side pool)
     iq_relations: list = _dcfield(default_factory=list)
+    # --- onlap / seed-iso metadata (baselap-onto-conformal + interface-seeded path) ---
+    onlap_package: bool = False       # base is a baselap onto a conformal package (not an unconformity)
+    onlap_event: str = None           # name of the event this one onlaps (unconformity or lower package); None for basement
+    onlap_iso_id: str = None          # carve iso-id of the onlap threshold on ``onlap_event``
+    top_iso: str = None               # name of this package's top isosurface (set when a younger package onlaps it)
+    seed_isos: bool = False           # surfaces are seeded from interface points (values not learned)
 
 
 def _default_hset(has_normals: bool, has_iq: bool) -> HSet:
@@ -535,6 +574,12 @@ _UNCONF_ISO = "unconformity"
 _IQ_WEIGHT = 1.0
 _OVERTURN_WEIGHT = 30.0
 
+#: Gradient-normalised interface (equality) weight, used when a field is fit to on-contact
+#: (interface) points — the seed-iso / hybrid path (skmb). Matches the on-surface path's
+#: default. The eq loss pins each contact's field value to its interface points, so the
+#: seeded isosurface reads a stable, data-driven iso-value (no learnable iso needed).
+_EQ_WEIGHT = 1.0
+
 #: Field output range for the unit-only path. Both ``Siren`` and ``GeoINR`` evaluate as
 #: ``scale * mlp(x)``, and the raw network ``mlp(x)`` is O(1) at initialisation, so this
 #: ``scale`` *is* the field's value range (``BaseNF``'s default is ``1e2``). It is held at
@@ -580,14 +625,16 @@ def _cap_level_pools(obs, Xm, cap_per_unit, rng):
     return pools
 
 
-def _make_field(field_cls, name, ndim, field_kwargs, C=None, strat_loss=False):
+def _make_field(field_cls, name, ndim, field_kwargs, C=None, strat_loss=False, eq_loss=False):
     """
     Construct a neural field with the given (optional) CSet.
 
     The ``HSet`` is all-zero — on the unit-only path the loss comes entirely from
     the GeoINR-side terms, enabled with ``strat_loss=True`` (``iq_norm_weight`` /
-    ``overturn_weight``; see :class:`curlew.fields.geoinr.GeoINR`). The
-    field output ``scale`` defaults to :data:`_FIELD_SCALE` (~1) so the no-overturn
+    ``overturn_weight``; see :class:`curlew.fields.geoinr.GeoINR`). ``eq_loss=True``
+    additionally enables the gradient-normalised **interface** loss (``eq_norm_weight``)
+    when the field carries on-contact (``CSet.eq``) traces — the seed-iso / hybrid path.
+    The field output ``scale`` defaults to :data:`_FIELD_SCALE` (~1) so the no-overturn
     magnitude term stays O(1); explicit ``field_kwargs`` entries still win.
     """
     fkw = dict(field_kwargs or {})
@@ -595,6 +642,8 @@ def _make_field(field_cls, name, ndim, field_kwargs, C=None, strat_loss=False):
     if strat_loss:
         fkw.setdefault("iq_norm_weight", _IQ_WEIGHT)
         fkw.setdefault("overturn_weight", _OVERTURN_WEIGHT)
+    if eq_loss:
+        fkw.setdefault("eq_norm_weight", _EQ_WEIGHT)
     return field_cls(name, H=HSet().zero(), C=C, input_dim=ndim, **fkw)
 
 
@@ -665,10 +714,27 @@ def _build_region_only_event(name, levels, level_pts, ndim, field_cls, field_kwa
 
 
 def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_pts,
-                           ndim, field_cls, field_kwargs, iq_samples, grid, trend):
+                           ndim, field_cls, field_kwargs, iq_samples, grid, trend,
+                           iface_pts=None, below_iface=None):
     """
     Build an **erosional** unconformity event (SPEC §4.2): its own ``strati``
     event (``mode='above'``) that truncates older geology above its iso.
+
+    When ``iface_pts`` (on-contact points lying on the unconformity surface, model
+    coords) is given, the iso is **seeded** from them and an ``eq`` trace pins the
+    field to that surface (the seed-iso / hybrid path) — so the unconformity's value is
+    read directly from the interface data rather than estimated/learned. Otherwise the
+    iso is named-only and its value is set post-fit (wcsb path).
+
+    ``below_iface`` (a list of every **older** unconformity's on-surface point array, model
+    coords) adds a **surface-nesting** inequality — **one pair per older surface** so each
+    (e.g. the Precambrian) gets its own full ``iq_samples`` draw rather than a fraction of one
+    pooled set (the margin, where surfaces converge, is otherwise under-sampled and still cut).
+    Each pair orders this unconformity's own surface points ``>`` an older surface's points
+    *in this field*, so the older surface stays **below this iso** and is not eroded by it.
+    The seed-iso path needs this because the deep, unit-sparse region carries no soft-unit (CE)
+    signal, so nothing otherwise stops a younger unconformity from floating above its iso right
+    at an older surface and cutting below it (e.g. below the Precambrian).
 
     With no on-surface points the surface is constrained purely by **point-vs-point
     inequalities** (``CSet.iq``), consumed by the GeoINR gradient-normalised
@@ -703,49 +769,73 @@ def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_p
         # relation entries carry the pooled above side as a tuple of levels
         iq_relations = [(tuple(above), B, ">") for B in below]
 
+    has_iface = iface_pts is not None and len(iface_pts) > 0
+
+    # surface nesting: this unconformity's own surface sits above every older unconformity's
+    # surface (one pair each), so the older surfaces stay below this iso and are not eroded.
+    if has_iface and below_iface:
+        own = np.asarray(iface_pts, float)
+        for older_pts in below_iface:
+            older_pts = np.asarray(older_pts, float)
+            if len(older_pts):
+                iq_pairs = list(iq_pairs) + [(own, older_pts, ">")]
+                iq_relations = list(iq_relations) + [((eroded_level,), "older-unconformity-surface", ">")]
+
     C = CSet(crs="model")
     if iq_pairs:
         C.iq = (int(iq_samples), iq_pairs)
+    if has_iface:
+        C.eq = [np.asarray(iface_pts, float)]
     C.grid = grid.copy()
     C.trend = trend
-    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True)
+    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True,
+                       eq_loss=has_iface)
 
     ev = strati(name, C=fobj, mode="above", base=_UNCONF_ISO)
+    if has_iface:
+        ev.addIsosurface(_UNCONF_ISO, seed=np.asarray(iface_pts, float))
 
     meta = _FieldMeta(name=name, kind="erosional", unit_indices=[],
                       is_unconformity=True, iso_name=_UNCONF_ISO,
                       above_levels=list(above_levels), below_levels=list(below),
                       eroded_level=eroded_level,
-                      n_iq=len(iq_pairs), iq_relations=iq_relations)
+                      n_iq=len(iq_pairs), iq_relations=iq_relations,
+                      seed_isos=has_iface)
     return ev, meta
 
 
 def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts,
                                  ndim, field_cls, field_kwargs, iq_samples,
-                                 grid, trend, onlap_iso=None):
+                                 grid, trend, onlap_iso=None, iface_by_level=None,
+                                 below_iface=None):
     """
-    Build a **depositional** package from unit points only (SPEC §4.2, wcsb).
+    Build a **depositional** package from unit points (SPEC §4.2, wcsb).
 
     ``levels_young_to_old`` are the package's unit levels (ascending = youngest→oldest).
     Each pair of **adjacent** bands is ordered with a point-vs-point inequality
     (``CSet.iq``: younger band points ``>`` older band points), consumed by the GeoINR
     gradient-normalised inequality loss; a **no-overturn** regularizer keeps the field
-    monotone. The internal contacts carry no value at build time — they are estimated
-    after fitting by :func:`estimate_isosurfaces` (between the two adjacent bands'
-    field-value distributions). Each contact is **named after the older unit whose top
-    it is** (so an eroded top unit never names a contact — its true top is the
-    unconformity; e.g. there is no "Pennsylvanian" contact). Note curlew labels the
-    band immediately *above* an isosurface with the isosurface's name, so the band
-    lithology *keys* read like surface names (``"<pkg>_<older unit> Top"``) — the
-    ``level_litho`` map keeps the level→lithology bookkeeping exact. The oldest band
-    is the event's base lithology (the event name). When ``onlap_iso`` is given the
-    package onlaps the unconformity below it.
+    monotone. Each contact is **named after the older unit whose top it is** (a contact is
+    the top of the unit below it). Note curlew labels the band immediately *above* an
+    isosurface with the isosurface's name, so the band lithology *keys* read like surface
+    names (``"<pkg>_<older unit> Top"``) — the ``level_litho`` map keeps the
+    level→lithology bookkeeping exact. The oldest band is the event's base lithology (the
+    event name). When ``onlap_iso`` is given the package onlaps the surface below it.
+
+    When ``iface_by_level`` is given (the seed-iso / hybrid path), each internal contact
+    is additionally given an ``eq`` trace + **seed isosurface** from the on-contact points
+    at its (older-unit) level — pinning the contact's value to the interface data instead
+    of estimating it post-fit. Contacts with no on-contact points are left value-free.
     """
     levels = list(levels_young_to_old)
     k = len(levels)
+    iface_by_level = iface_by_level or {}
 
     def pool(L):
         return level_pts.get(L, np.empty((0, ndim)))
+
+    def iface(L):
+        return iface_by_level.get(L, np.empty((0, ndim)))
 
     # Contact j sits between band j (younger) and band j+1 (older): it is the TOP of band
     # j+1, so name it after that older unit (a contact is the top of the unit below it).
@@ -758,17 +848,57 @@ def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts
             iq_pairs.append((pool(levels[j]), pool(levels[j + 1]), ">"))
             iq_relations.append((levels[j], levels[j + 1], ">"))
 
+    # on-contact (interface) traces + seeds: contact j lives on the top of unit levels[j+1]
+    eq_traces, seed_specs = [], []
+    for j in range(k - 1):
+        ipts = iface(levels[j + 1])
+        if len(ipts):
+            pts = np.asarray(ipts, float)
+            eq_traces.append(pts)
+            seed_specs.append((contact_names[j], pts))
+    has_iface = len(eq_traces) > 0
+
+    # within-package contact ordering (seed-iso path): a younger contact's on-surface points
+    # sit ABOVE the next-older contact's, in this field — so the contacts keep stratigraphic
+    # order (younger surface = higher value) and cannot cross where the interface data defines
+    # them. The eq traces pin each surface's value; this iq keeps the seeded contacts ordered.
+    contact_levels = [levels[j + 1] for j in range(k - 1)]   # young → old
+    for i in range(len(contact_levels) - 1):
+        yk, ok = iface(contact_levels[i]), iface(contact_levels[i + 1])
+        if len(yk) and len(ok):
+            iq_pairs.append((np.asarray(yk, float), np.asarray(ok, float), ">"))
+            iq_relations.append((contact_levels[i], contact_levels[i + 1], ">"))
+
+    # package-top nesting: the package's TOP contact (the top of its youngest unit) is the
+    # surface a younger **baselap-onto-conformal** package onlaps. It must sit ABOVE every
+    # OLDER unconformity surface (one pair each), so the package's field stays below that
+    # threshold at the older surfaces — otherwise a younger package onlapping this top reaches
+    # down and erodes below an older surface (e.g. the Precambrian) at the basin margin.
+    top_pts = iface(levels[0])
+    if len(top_pts) and below_iface:
+        top_pts = np.asarray(top_pts, float)
+        for older_pts in below_iface:
+            older_pts = np.asarray(older_pts, float)
+            if len(older_pts):
+                iq_pairs.append((top_pts, older_pts, ">"))
+                iq_relations.append((levels[0], "older-unconformity-surface", ">"))
+
     C = CSet(crs="model")
     if iq_pairs:
         C.iq = (int(iq_samples), iq_pairs)
+    if eq_traces:
+        C.eq = eq_traces
     C.grid = grid.copy()
     C.trend = trend
-    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True)
+    fobj = _make_field(field_cls, name, ndim, field_kwargs, C=C, strat_loss=True,
+                       eq_loss=has_iface)
 
     if onlap_iso is not None:
         ev = strati(name, C=fobj, mode="above", base=onlap_iso, onlap=True)
     else:
         ev = strati(name, C=fobj)
+    for cname, pts in seed_specs:
+        ev.addIsosurface(cname, seed=pts)
 
     oldest = levels[-1]
     level_litho = {oldest: name}              # base lithology (oldest band = event name)
@@ -782,14 +912,15 @@ def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts
 
     meta = _FieldMeta(name=name, kind="depositional", unit_indices=[],
                       levels=levels, contacts=contacts, level_litho=level_litho,
-                      n_iq=len(iq_pairs), iq_relations=iq_relations)
+                      n_iq=len(iq_pairs), iq_relations=iq_relations,
+                      seed_isos=has_iface)
     return ev, meta
 
 
 def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwargs,
                            iq_samples, cap_per_unit, seed, reg_samples, reg_grid_n):
     """
-    Build the wcsb-style event chain (oldest→youngest) from unit points only.
+    Build the strat-column event chain (oldest→youngest) from point observations.
 
     The partitioner emits an alternating youngest-first sequence of erosional and
     depositional fields. Reversed to oldest-first, this builder:
@@ -799,17 +930,24 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
     2. builds each **erosional** event (``iq`` above-vs-below ordering, no-overturn)
        — see :func:`_build_erosional_event`,
     3. builds each **depositional** package (``iq`` adjacent-band ordering,
-       no-overturn), onlapping the unconformity below it,
+       no-overturn), onlapping the surface below it — an **unconformity** (``eroded``
+       neighbour) or, for a **baselap-onto-conformal** package (``sf.onlap_package``),
+       the **top of the conformal package directly below it**,
     4. synthesizes a **region-only** event for the dropped youngest baselap unit
        (top of column), onlapping the youngest unconformity.
 
-    Surface iso-values are NOT set here — call :func:`estimate_isosurfaces` after
-    fitting. Returns ``(events, field_meta, level_litho, level_pts)``.
+    When the observations carry **on-contact (interface) points**, every surface is
+    additionally **seeded** from them (``eq`` traces + seed isosurfaces) so its iso-value
+    is read directly from the interface data — the seed-iso / hybrid path. With only unit
+    points (wcsb) the surfaces stay value-free; call :func:`estimate_isosurfaces` (or use
+    the learnable :class:`~curlew.geology.softunit.UnitLoss`) after fitting.
+
+    Returns ``(events, field_meta, level_litho, level_pts)``.
     """
     assert isinstance(field_cls, type) and issubclass(field_cls, GeoINR), (
-        "The unit-only path requires a GeoINR-family field ('GeoINR' or 'Siren'): its "
-        "constraints are pure inequalities, which need the gradient-normalised "
-        "inequality + no-overturn losses these fields implement."
+        "The chain path requires a GeoINR-family field ('GeoINR' or 'Siren'): its "
+        "inequality / interface constraints need the gradient-normalised inequality, "
+        "interface and no-overturn losses these fields implement."
     )
     rng = np.random.default_rng(seed)
     level_pts = _cap_level_pools(obs, Xm, cap_per_unit, rng)
@@ -817,6 +955,14 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
     # shared no-overturn grid (model coords); GeoINR-scale sampling by default
     grid = _model_grid(Xm, ndim, n=reg_grid_n, draw=reg_samples)
     trend = _trend_up(ndim)             # younging-up direction (+z)
+
+    # on-contact (interface) points by level, in model coords (empty when none present)
+    iface_by_level = {}
+    if bool(obs.is_interface.any()):
+        imask = obs.is_interface
+        for L in obs.levels("interface"):
+            iface_by_level[L] = Xm[imask & (obs.level == L)]
+    eroded_levels = sorted(u.level for u in units if u.relation == "eroded")  # for surface nesting
 
     used_names = set()
     def uniq(base):
@@ -849,9 +995,14 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
 
             eroded_level = units[sf.horizon_unit_indices[0]].level
             ename = uniq(f"{unit_name(eroded_level)} Unconformity")
+            # on-surface points of every OLDER unconformity, one array each (for surface nesting)
+            below_iface = [iface_by_level[L] for L in eroded_levels
+                           if L > eroded_level and len(iface_by_level.get(L, ()))]
             ev, meta = _build_erosional_event(
                 ename, eroded_level, above_levels, all_levels, level_pts, ndim,
-                field_cls, field_kwargs, iq_samples, grid, trend)
+                field_cls, field_kwargs, iq_samples, grid, trend,
+                iface_pts=iface_by_level.get(eroded_level),
+                below_iface=below_iface)
 
             # the oldest erosional eroded the basement: synthesize a region-only basement
             # event below it (the eroded unit(s) become its lithology). Its field is an
@@ -865,16 +1016,66 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
                     bname, base_levels, level_pts, ndim, field_cls, field_kwargs,
                     alias_of=ev.getField(0))
                 events.append(bev); metas.append(bmeta); level_litho.update(bmeta.level_litho)
+            elif sf.unit_indices:
+                # a unit sandwiched between two consecutive (doubled) unconformities: its
+                # material is preserved between the **older** unconformity below it (the
+                # previously-built event, which it ONLAPS) and **this** unconformity above it
+                # (built next, which TRUNCATES it). Without this region the band between the
+                # two iso surfaces is claimed by no event — a void. Its field aliases the
+                # older unconformity's (the surface it sits on), like the basement/top regions.
+                sand_levels = sorted({units[u].level for u in sf.unit_indices})
+                sname = uniq(unit_name(sand_levels[-1]))
+                onlap_prev = bool(metas and metas[-1].is_unconformity and last_erosional is not None)
+                sev, smeta = _build_region_only_event(
+                    sname, sand_levels, level_pts, ndim, field_cls, field_kwargs,
+                    onlap_iso=_UNCONF_ISO if onlap_prev else None,
+                    alias_of=last_erosional.getField(0) if onlap_prev else None)
+                if onlap_prev:
+                    smeta.onlap_event = metas[-1].name
+                    smeta.onlap_iso_id = f"{metas[-1].name}::unconf"
+                events.append(sev); metas.append(smeta); level_litho.update(smeta.level_litho)
 
             events.append(ev); metas.append(meta)
             last_erosional = ev
         else:  # depositional package
             levels = sorted({units[u].level for u in sf.unit_indices})  # young → old
-            onlap_iso = _UNCONF_ISO if (metas and metas[-1].is_unconformity) else None
+            # what this package onlaps: the unconformity directly below it, or — for a
+            # baselap-onto-conformal package — the top of the conformal package below.
+            onlap_iso = onlap_event = onlap_iso_id = None
+            if metas and metas[-1].is_unconformity:
+                onlap_iso = _UNCONF_ISO
+                onlap_event = metas[-1].name
+                onlap_iso_id = f"{onlap_event}::unconf"
+            elif sf.onlap_package:
+                assert metas and metas[-1].kind == "depositional", (
+                    "baselap-onto-conformal package expects the conformal package it "
+                    "onlaps to have been built immediately before it."
+                )
+                lower_ev, lower_meta = events[-1], metas[-1]
+                top_level = lower_meta.levels[0]   # youngest level of the lower package
+                top_pts = iface_by_level.get(top_level)
+                assert top_pts is not None and len(top_pts) > 0, (
+                    f"baselap-onto-conformal: the lower package '{lower_meta.name}' needs "
+                    f"on-contact points at its top (level {top_level}) to seed the onlap "
+                    "surface; this pattern requires interface observations."
+                )
+                top_name = f"{unit_name(top_level)} Top"
+                lower_ev.addIsosurface(top_name, seed=np.asarray(top_pts, float))
+                lower_meta.top_iso = top_name
+                onlap_iso, onlap_event = top_name, lower_meta.name
+                onlap_iso_id = f"{onlap_event}::top"
+
             pname = uniq(unit_name(levels[-1]))   # base (oldest) band names the event
+            # on-surface points of every unconformity OLDER than this package (one array each),
+            # so the package's top iso (a baselap onlap threshold) nests above them.
+            pkg_below = [iface_by_level[L] for L in eroded_levels
+                         if L > levels[-1] and len(iface_by_level.get(L, ()))]
             ev, meta = _build_depositional_iq_event(
                 pname, levels, unit_name, level_pts, ndim, field_cls, field_kwargs,
-                iq_samples, grid, trend, onlap_iso=onlap_iso)
+                iq_samples, grid, trend, onlap_iso=onlap_iso,
+                iface_by_level=iface_by_level, below_iface=pkg_below)
+            meta.onlap_package = bool(sf.onlap_package)
+            meta.onlap_event, meta.onlap_iso_id = onlap_event, onlap_iso_id
             events.append(ev); metas.append(meta); level_litho.update(meta.level_litho)
 
     # synthesize the dropped youngest unit (a top baselap package the partitioner
@@ -1010,31 +1211,39 @@ _COUPLED_OVERTURN_WEIGHT = 6.0
 
 
 def attach_unit_loss(M, *, tau=0.05, points_per_level=1024, iso_lr=None, weight=1.0,
-                     overturn_weight=_COUPLED_OVERTURN_WEIGHT):
+                     overturn_weight=_COUPLED_OVERTURN_WEIGHT, seed_isos=False):
     """
-    Build a :class:`~curlew.geology.softunit.UnitLoss` for a unit-only model and switch
+    Build a :class:`~curlew.geology.softunit.UnitLoss` for a chain-path model and switch
     its fields onto the **coupled** recipe (SOFTUNIT_SPEC §4, §6).
 
     This is the entry point for the unit (soft-carve / NLL) coupling: instead of fitting
     each field independently with inequalities and estimating surfaces post-hoc, the
-    returned loss couples **all** scalar fields plus shared, learnable iso-values in one
-    cross-entropy against the true unit levels. Pass it to
-    :meth:`~curlew.geology.geomodel.GeoModel.fit` as ``custom_loss=[loss]``, then call
+    returned loss couples **all** scalar fields in one cross-entropy against the true unit
+    levels. Pass it to :meth:`~curlew.geology.geomodel.GeoModel.fit` as
+    ``custom_loss=[loss]``, then call
     :meth:`~curlew.geology.softunit.UnitLoss.write_isosurfaces` before predicting
-    (``estimate_isosurfaces`` is **not** used on this path — the isos are learned).
+    (``estimate_isosurfaces`` is **not** used on this path).
 
     On the coupled path each field's ``iq_norm_weight`` is set to 0 (the cross-entropy
     supersedes the inequality ordering, mirroring GeoINR's ``include_unit_constraints=False``)
     and its ``overturn_weight`` is **relaxed** to :data:`_COUPLED_OVERTURN_WEIGHT` (the CE
     already enforces ordering at the data, so the per-field path's strong magnitude prior of
     30 is redundant here and over-smooths the fit — see that constant). ``HSet`` stays
-    all-zero, as on the per-field path. The existing per-field path, ``_FieldMeta`` and
-    :func:`estimate_isosurfaces` are unchanged.
+    all-zero, as on the per-field path.
+
+    Two iso regimes:
+
+    - **learnable** (``seed_isos=False``, wcsb): the coupling owns shared, learnable
+      iso-values and writes them post-fit. No on-contact data needed.
+    - **seeded** (``seed_isos=True``, skmb): the iso-values are read from interface-seeded
+      isosurfaces each step (no learnable isos). The fields keep their **interface**
+      (``eq_norm``) loss so the contacts stay pinned to the on-contact data; nothing is
+      written post-fit (the seeds already resolve at predict).
 
     Parameters
     ----------
     M : curlew.geology.geomodel.GeoModel
-        A model built by :func:`build_geomodel`'s unit-only path (not yet fitted). Use a
+        A model built by :func:`build_geomodel`'s chain path (not yet fitted). Use a
         generous ``cap_per_unit`` (or ``None``): on the coupled path balance comes from
         ``points_per_level``, so the cap only limits the distinct geometry the fields see.
     tau : float, optional
@@ -1043,6 +1252,7 @@ def attach_unit_loss(M, *, tau=0.05, points_per_level=1024, iso_lr=None, weight=
         Points sampled per level each epoch (balanced sampling, default 1024).
     iso_lr : float, optional
         Learning rate for the iso-value optimiser (default ~10× a coupled field's lr).
+        Unused when ``seed_isos=True``.
     weight : float, optional
         Weight on the NLL loss term (default 1.0).
     overturn_weight : float, optional
@@ -1050,6 +1260,9 @@ def attach_unit_loss(M, *, tau=0.05, points_per_level=1024, iso_lr=None, weight=
         build time. Defaults to :data:`_COUPLED_OVERTURN_WEIGHT`. Lower → better marker
         fit but more deep-region inversions in ``GeoModel.predict``; ``None`` leaves each
         field's built value untouched.
+    seed_isos : bool, optional
+        Read iso-values from interface-seeded isosurfaces instead of learning them (the
+        hybrid skmb path; the model must have been built with interface observations).
 
     Returns
     -------
@@ -1059,18 +1272,26 @@ def attach_unit_loss(M, *, tau=0.05, points_per_level=1024, iso_lr=None, weight=
     from curlew.geology.softunit import UnitLoss
 
     assert getattr(M, "level_points", None) is not None, (
-        "attach_unit_loss requires a model built by build_geomodel's unit-only path "
+        "attach_unit_loss requires a model built by build_geomodel's chain path "
         "(M.level_points missing)."
     )
-    # CE supersedes the per-field inequality ordering; relax the (now mostly redundant)
-    # no-overturn prior so it does not over-smooth the coupled fit.
+    # relax the (now mostly redundant) no-overturn prior so it does not over-smooth the fit.
+    # The unit-only (learnable) path zeros iq_norm — the CE supersedes the inequality ordering
+    # where unit points are dense. The seeded path instead **keeps iq_norm on**: the interface
+    # data defines the surfaces directly, and the gradient-normalised inequalities order them
+    # where the CE is silent — within a package (younger contact above older) and, crucially,
+    # across unconformities (older surfaces stay below a younger iso), in the deep, unit-sparse
+    # regions the CE cannot reach. The hinge is zero once satisfied, so it does not fight the
+    # eq/CE fit; it only corrects the ordering violations (e.g. a younger unconformity cutting
+    # below the Precambrian).
     for meta in M.field_meta:
         f = M[meta.name].getField(0)
         if hasattr(f, "iq_norm_weight"):
-            f.iq_norm_weight = 0.0
+            f.iq_norm_weight = _IQ_WEIGHT if seed_isos else 0.0
         if (overturn_weight is not None) and hasattr(f, "overturn_weight"):
             f.overturn_weight = float(overturn_weight)
-    return UnitLoss(M, tau=tau, points_per_level=points_per_level, iso_lr=iso_lr, weight=weight)
+    return UnitLoss(M, tau=tau, points_per_level=points_per_level, iso_lr=iso_lr,
+                    weight=weight, seed_isos=seed_isos)
 
 
 def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
@@ -1164,8 +1385,15 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
         transform = _normalization_transform(observations.bounds(), scale, ndim)
     Xm = transform.apply(observations.coords.astype(float))
 
-    level_litho = {}
-    if bool(observations.is_interface.any()):
+    # path selection: the simple **on-surface** path handles an all-depositional column
+    # with contact points (multilayer_fold); any column with unconformities or a
+    # baselap-onto-conformal split goes through the **chain** path, which consumes
+    # interface points when present (skmb) and falls back to unit-only (wcsb).
+    has_structure = any(sf.kind == "erosional" or sf.onlap_package for sf in sfields)
+    use_on_surface = bool(observations.is_interface.any()) and not has_structure
+
+    level_litho, level_pts = {}, None
+    if use_on_surface:
         # ---- on-surface path (multilayer_fold): depositional events only ----
         events, field_meta = [], []
         for sf in reversed(sfields):  # GeoModel expects oldest→youngest
@@ -1173,7 +1401,7 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
                 raise NotImplementedError(
                     "The on-surface path supports depositional packages with contact "
                     f"points only; field '{sf.name}' is '{sf.kind}'. Datasets with only "
-                    "unit points (no interface points) use the unit-only chain instead."
+                    "unit points (no interface points) use the chain path instead."
                 )
             ev, meta = _build_depositional_event(
                 sf, units, observations, Xm, ndim, field_cls, field_kwargs, hset, iq_samples
@@ -1181,7 +1409,7 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
             events.append(ev)
             field_meta.append(meta)
     else:
-        # ---- unit-only path (wcsb): iq-ordering / no-overturn chain ----
+        # ---- chain path (wcsb unit-only / skmb interface+unit hybrid) ----
         events, field_meta, level_litho, level_pts = _build_unit_only_chain(
             units, sfields, observations, Xm, ndim, field_cls, field_kwargs,
             iq_samples, cap_per_unit, seed, reg_samples, reg_grid_n,
@@ -1197,7 +1425,8 @@ def build_geomodel(strat_col_csv, observations, *, field="GeoINR",
     M.observations = observations
     M.normalization = transform
     M.level_litho = level_litho
-    if not bool(observations.is_interface.any()):
-        # capped per-level unit pools (model coords) — needed by estimate_isosurfaces
+    if level_pts is not None:
+        # capped per-level unit pools (model coords) — needed by estimate_isosurfaces /
+        # the soft-unit coupling (both the learnable wcsb path and the seeded skmb path)
         M.level_points = level_pts
     return M
