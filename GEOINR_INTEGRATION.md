@@ -71,13 +71,30 @@ Every generative event has an `Overprint` that decides, point-by-point, where th
 rock replaces the older rock below it. The **domain** of that decision is one scalar field,
 chosen by `Overprint.defaultDomain`:
 
-**`defaultDomain='child'` — erosional truncation.** The boundary is *this event's own*
-field. The unconformity cuts the older beds; its surface geometry is its own.
+**`defaultDomain='child'` — erosional truncation.** The boundary is *this event's own* field: the
+unconformity's own iso is the cut surface, and it bevels the older beds beneath. An erosional
+unconformity **owns no rock of its own** (every erosional event has `owns_band=False`, verified on
+the model), so it enters the combine as a **two-step** build — which is the key to reading these
+two panels:
 
-![Child-domain erosional truncation: the child event's own scalar field supplies the overprint boundary.](docs/assets/geoinr-integration/onlap-child-domain.svg)
+1. **Cut step (this `child` event).** With `mode='above'` it claims everything *above* its iso and
+   overprints it with **its own field** — so in this step the region above is layered ≈*parallel to
+   the cut* (it **is** the unconformity's field). Below the iso the older beds are kept; above, they
+   are removed. This is the truncation.
+2. **Fill step (the younger package, `parent`).** The depositional event *younger* than the
+   unconformity then overprints that same region and **replaces** it with its own beds — which
+   **baselap onto the cut and need not be parallel to it** (they pinch out against the surface; the
+   `parent` case below).
 
-The red surface is the child event's isosurface. With `mode='above'`, points above that
-surface get the child event's output; older parent beds are cut off at that same surface.
+So the *overlying* beds are **not** generally parallel to the unconformity — that parallel look is
+only the transient cut-step field, which the younger package overwrites. The figure below shows the
+**cut step**; the `parent` figure shows the fill step.
+
+![Child-domain erosional truncation (the cut step): the unconformity's own field cuts/bevels the older beds beneath and overprints the region above with its own ≈parallel field; the younger package replaces that region in the parent step, baselapping onto the cut.](docs/assets/geoinr-integration/onlap-child-domain.svg)
+
+(The same `child` mechanic, when the event *does* own rock — a conformable series in
+`multilayer_fold`, or the basement with `base=−∞` — instead deposits its *own* beds above its base.
+In the skmb/wcsb chain the only `child` events are the basement and the erosional truncations.)
 
 **`defaultDomain='parent'` — onlap.** The boundary is the *parent* (the older unconformity
 it sits on). Younger beds lap onto — and pinch out against — that older surface.
@@ -109,6 +126,38 @@ youngest contact's interface points), and the upper package onlaps it with the *
 this is the Westgate→Viking, Torquay→Birdbear, 1stRedBed→DawsonBay and Winnipegosis→Ashern
 relationships. wcsb has no such case (every wcsb baselap is followed by `eroded`), so its
 partition is unchanged.
+
+### How the column relations choose the domain
+
+The `relation` column (`conformal` / `baselap` / `eroded`) is what drives the `child`/`parent`
+choice, by one rule per relation:
+
+| pattern in the column | becomes | overprint domain |
+|---|---|---|
+| `eroded` | an **erosional unconformity** event — *truncates* older rock, owns no band | **`child`** (its own field) |
+| a package whose base sits on an `eroded` below it | a depositional package that **onlaps the unconformity** | **`parent`** (the unconformity field) |
+| a `baselap` whose next-older unit is `conformal` (baselap-onto-conformal) | a depositional package that **onlaps the lower package's top** | **`parent`** (the lower package's top iso) |
+| the oldest unit(s), below the deepest `eroded` | the **basement** region | `child`, `base=−∞` (claims everything below) |
+
+So **every `eroded` adds one `child` truncation; every package adds one `parent` onlap.** Worked
+on your two examples (youngest→oldest, build order shown oldest→youngest):
+
+**`conformal, baselap, eroded, conformal`**
+- oldest `conformal` → **basement** (`child`, `base=−∞`)
+- `eroded` → **unconformity** (**`child`** — truncates the basement)
+- `{conformal, baselap}` → package **onlapping that unconformity** (**`parent`**)
+
+**`conformal, baselap, conformal, conformal, baselap, eroded, conformal`**
+- oldest `conformal` → **basement** (`child`)
+- `eroded` → **unconformity** (**`child`**)
+- `{conformal, conformal, baselap}` → package **onlapping the unconformity** (**`parent`**)
+- `{conformal, baselap}` → upper package, **baselap-onto-conformal**, **onlapping the lower
+  package's top** (**`parent`**)
+
+The key reading: **`parent` (onlap) is the general case** — one per package, in *both* sequences;
+baselap-onto-conformal is just a `parent` onlap onto a package **top** instead of an unconformity.
+**`child` is the `eroded` unconformity** (plus the basement) — a truncation that owns no rock, with
+the younger package filling above it.
 
 ---
 
