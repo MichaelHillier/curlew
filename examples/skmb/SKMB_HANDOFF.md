@@ -4,6 +4,67 @@ Working notes for refining the **skmb** example and the **seed-iso** (interface 
 path in a fresh session. Companion to [GEOINR_INTEGRATION.md](../../GEOINR_INTEGRATION.md)
 (the readable walkthrough) and [SOFTUNIT_SPEC.md](../../SOFTUNIT_SPEC.md) (the wcsb design).
 
+## 0. Update — 2026-06-23 (Poisson sampling + consolidation + cost cuts: DONE)
+
+Final shape after a regression hunt (see "Volume-artifact regression" below). Changes in
+[stratbuilder.py](../../curlew/geology/stratbuilder.py); the wcsb (`seed_isos=False`) and
+multilayer_fold paths are unchanged (`test_stratbuilder.py` + `test_softunit.py` confirm):
+
+1. **Overturn → Poisson-disk** (`_model_grid(..., poisson=True)`, gated on interface-presence):
+   model-scaled radius `r = 0.75·(V/draw)^(1/d)` over a fine candidate lattice (step ≈ r/2,
+   capped 64/axis), `seed=None` (fresh each epoch). wcsb keeps the uniform-from-lattice draw.
+   → **cleaner basin-margin geology** (the §4a goal).
+2. **Consolidated** the three surface ordering/nesting iq terms (within-package interface,
+   unconformity nesting, package-top nesting) into one builder `_surface_ordering_iq` around
+   the §2 principle — same pairs, one place. Behaviour-preserving.
+3. **Cost cut (the safe one only): `iq_samples` 1024→256** — 4× cheaper iq sampling, accuracy-
+   neutral. The other two suggested cuts were **reverted** (below).
+
+### Volume-artifact regression (2026-06-23 — found by user review, fixed)
+
+The two *constraint-removing* cost cuts — dropping the within-package **unit-point band iq**
+and **trimming the erosional below-side** to a pooled "deep" reference — left marker accuracy
+unchanged (the point/margin metrics never saw it) but **reintroduced deep-region volume-
+inversion islands** (younger units carved into older rock *between* the markers — the ugly
+artifacts the user rendered). Those per-level inequalities are the **deep-region anchors**: with
+the no-overturn prior they keep the unconformity/package fields well-behaved across the data-
+sparse deep regions. **Both cuts were reverted** (full per-level below-side + unit-point band iq
+kept on both paths; this also removed the `seed_path` branching → simpler code).
+
+A new **volume age-inversion metric** in `_diagnostics.py` (grid predict; count columns where an
+older level sits above a younger — the artifacts the point metrics miss) made it measurable, on a
+90³ grid:
+
+| config | @1200 ep | @2000 ep | band @2000 |
+|---|---|---|---|
+| cost cuts ON (the regression) | **2.20%** | — | — |
+| **restored** (iq256, Poisson, full) — SHIPPED | **0.47%** | **1.91%** | 0.842 |
+| OLD reference (uniform, iq1024, full) | 0.67% | **8.78%** | 0.879 |
+
+Three findings:
+1. **The cost cuts caused the user's clustered islands** — restoring the per-level anchors fixes
+   them (2.20→0.47% @1200), and the **shipped config is cleaner on the volume than the old code**
+   while keeping Poisson's margin win + the 4× iq speedup.
+2. **Reproducible Poisson** — the original `seed=None` was non-reproducible run-to-run AND unstable
+   (deep volume swung 0.5–7% across runs). Fixed in `geometry.py`: a `None` Poisson seed now draws
+   its per-call seed from the **global NumPy RNG** (so `np.random.seed()` makes a whole run
+   reproducible, like the uniform `np.random.choice` branch) while still re-drawing each epoch.
+   The variance vanished; numbers below are deterministic.
+3. **Over-training was an overturn-weight problem, not a hard ceiling** (user's instinct). skmb's
+   interface `eq` hard-pins the fields at the contacts; that curvature drives deep, data-sparse
+   regions to overturn as training continues — at the wcsb-coupled `overturn=6` the volume
+   inversions *grow* with epochs (1.91% @2000), at **`overturn=12` they *fall*** (0.36% @2000 →
+   **0.14% @3000**), i.e. **robust to long training like wcsb**. The interface `eq` already
+   separates the bands, so the stiffer prior costs only ~0.03 band (0.842→0.81, still ≫ wcsb's
+   coupled ~0.73). So `overturn=12` is the seed-iso default and **epochs are now a free choice**
+   (more = cleaner), not a cap.
+
+**Verified (GPU, reproducible Poisson, overturn=12): volume robustly clean** (0.36% @2000 →
+0.14% @3000, *falls* with training), **margins clean** (Precambrian cut ~0.1–0.4%), band ~0.81.
+Suite green (`test_skmb` 14, `test_softunit` 6, `test_stratbuilder` 2, `test_geometry` 4). Defaults
+iq=256 / reg=2000 / **ovt=12**; notebook keeps `N_EPOCHS=2000` (robust). Alternative for max band:
+`overturn=6` but then cap epochs ~1500 (drifts if over-trained).
+
 ## 1. Status (what works)
 
 skmb combines **interface points** (`markers.vtp`) and **unit points** (`units.vtp`) with

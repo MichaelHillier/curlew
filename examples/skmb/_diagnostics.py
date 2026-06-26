@@ -22,9 +22,12 @@ from curlew.io import loadObservations
 from curlew.geology.stratbuilder import build_geomodel, attach_unit_loss
 
 EPOCHS = int(sys.argv[1]) if len(sys.argv) > 1 else 500
-OVT = float(sys.argv[2]) if len(sys.argv) > 2 else 6.0
-IQ = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
-REG = int(sys.argv[4]) if len(sys.argv) > 4 else 5000
+OVT = float(sys.argv[2]) if len(sys.argv) > 2 else 12.0  # seed-iso path wants a stiffer no-overturn
+                                                          # prior than wcsb's coupled 6 (the interface
+                                                          # eq adds deep-region curvature) -> robust to
+                                                          # over-training (vol-inv falls with epochs)
+IQ = int(sys.argv[3]) if len(sys.argv) > 3 else 256       # iq samples/pair (4x cheaper than 1024)
+REG = int(sys.argv[4]) if len(sys.argv) > 4 else 2000     # model-scaled Poisson overturn (reproducible)
 
 curlew.device = os.environ.get("CURLEW_DEVICE", "cuda")
 torch.manual_seed(0); np.random.seed(0)
@@ -83,3 +86,30 @@ ls = {L: m.name for m in M.field_meta for L in m.levels}
 band = np.mean([litho[k] == M.level_litho[int(lev[k])] for k in range(len(lev))])
 strA = np.mean([struct[k] == ls[int(lev[k])] for k in range(len(lev))])
 print(f"\nband accuracy {band:.3f} | structure accuracy {strA:.3f}")
+
+# --- VOLUME quality: grid age-inversions (the deep-region 'island' artifacts that the
+# point metrics above miss; level ascending == older, so going UP the level should DECREASE).
+from curlew.geometry import Grid
+lo, hi = obs.bounds(); lo = np.asarray(lo, float); hi = np.asarray(hi, float)
+ext = np.maximum(hi - lo, 1e-6); center = 0.5 * (lo + hi)
+res = np.array([90, 90, 70])
+G = Grid(dims=tuple(ext), step=tuple(ext / res), center=tuple(center))
+curlew.batchSize = 100000
+gg = M.predict(G)
+id2level = {i: name2level.get(n, -1) for i, n in gg.lithoLookup.items()}
+levv = np.array([id2level.get(int(i), -1) for i in gg.lithoID])
+L3 = G.reshape(levv).astype(float)
+# find the vertical (z) index axis robustly: z varies only along it (axis-aligned grid)
+zc = G.reshape(G.coords()[:, 2])
+zaxis = int(np.argmax([abs(np.nanmean(np.diff(zc, axis=a))) for a in range(3)]))
+up_inc = np.nanmean(np.diff(zc, axis=zaxis)) > 0     # does increasing index go UP?
+Lz = np.moveaxis(L3, zaxis, -1)
+if not up_inc:
+    Lz = Lz[..., ::-1]
+up, dn = Lz[..., 1:], Lz[..., :-1]                    # up = the voxel above (larger z)
+valid = (up >= 0) & (dn >= 0)
+inv = valid & (up > dn)                                # older (larger level) sitting ABOVE younger
+col_inv = inv.any(axis=-1); col_unit = (Lz >= 0).any(axis=-1)
+print(f"volume age-inversions (grid {res[0]}x{res[1]}x{res[2]}): "
+      f"{100*col_inv.sum()/max(col_unit.sum(),1):.2f}% of unit columns | "
+      f"{int(inv.sum())} inverted adjacencies ({100*inv.sum()/max(valid.sum(),1):.3f}% of pairs)")

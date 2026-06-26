@@ -344,14 +344,19 @@ class Grid(object):
 
         # do random sampling
         if poissonDisk is not None: # Do poisson sampling to ensure evenly spaced points
+            radius, max_points, seed = poissonDisk
+            # seed=None means "fresh each call but reproducible": draw the per-call seed from
+            # the global NumPy RNG (so np.random.seed(...) makes a whole training run repeatable,
+            # mirroring the uniform np.random.choice branch) while still re-drawing every epoch.
+            # Pass an explicit int seed to get the same point set every call.
+            if seed is None:
+                seed = int(np.random.randint(0, 2**31 - 1))
             if grid.shape[1] == 2: # 2D Grid
                 ix = poisson_disk_indices_2d(grid[:, 0], grid[:, 1],
-                                              radius=poissonDisk[0], max_points=poissonDisk[1],
-                                              seed=poissonDisk[2])
+                                              radius=radius, max_points=max_points, seed=seed)
             else: # 3D Grid
                 ix = poisson_disk_indices_3d(grid[:, 0], grid[:, 1], grid[:, 2],
-                                              radius=poissonDisk[0], max_points=poissonDisk[1],
-                                              seed=poissonDisk[2])
+                                              radius=radius, max_points=max_points, seed=seed)
 
         else:
             ix = np.random.choice(len(grid), N, replace=False ) # draw random points from the grid (without replacement)

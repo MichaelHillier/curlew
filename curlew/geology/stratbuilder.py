@@ -589,14 +589,40 @@ _EQ_WEIGHT = 1.0
 _FIELD_SCALE = 1.0
 
 
-def _model_grid(Xm, ndim, n=24, draw=1000):
-    """A coarse :class:`~curlew.geometry.Grid` spanning the data in *model* space, used to
-    sample the no-overturn regularizer. ``draw`` random points are sampled per step."""
+def _model_grid(Xm, ndim, n=24, draw=1000, poisson=False):
+    """A :class:`~curlew.geometry.Grid` spanning the data in *model* space, used to sample
+    the no-overturn regularizer each epoch (``Grid.draw`` re-samples per step).
+
+    Two sampling regimes (chosen by ``poisson``):
+
+    - **uniform** (``poisson=False``, the wcsb unit-only path): ``draw`` points are picked
+      uniformly at random from a fixed ``n``-per-axis lattice (``sampleArgs={'N': draw}``).
+      Kept exactly as before so the seed_isos=False path is unchanged.
+    - **Poisson-disk** (``poisson=True``, the seed-iso / hybrid skmb path): ``draw`` points
+      are drawn with a **model-scaled** minimum separation so they cover the whole domain
+      **evenly** instead of clumping on a coarse lattice, and the candidate lattice is made
+      **fine** (step ≈ r/2) so the field effectively sees the continuum over training. The
+      radius ``r`` is sized so ~``draw`` points pack the data volume; ``seed=None`` re-draws
+      a fresh, evenly-spread set each epoch. Coarse-lattice under-coverage was the residual
+      basin-margin artefact source (SKMB_HANDOFF §4a).
+    """
     lo, hi = Xm.min(axis=0), Xm.max(axis=0)
     ext = np.maximum(hi - lo, 1e-6)
     center = 0.5 * (lo + hi)
-    return Grid(dims=tuple(ext), step=tuple(ext / float(n)), center=tuple(center),
-                sampleArgs={"N": int(draw)})
+    if not poisson:
+        return Grid(dims=tuple(ext), step=tuple(ext / float(n)), center=tuple(center),
+                    sampleArgs={"N": int(draw)})
+    # model-scaled Poisson radius: ~``draw`` points evenly spread through the data volume
+    # (V / (c·r^d) ≈ draw ⇒ r ≈ (V/draw)^(1/d); the 0.75 keeps r just below the packing
+    # limit so ``draw`` points are reliably placed — see the timing in SKMB_HANDOFF §4a).
+    V = float(np.prod(ext))
+    r = 0.75 * (V / max(int(draw), 1)) ** (1.0 / ndim)
+    # candidate lattice fine enough to place points at separation r (step ≈ r/2), capped so
+    # the per-epoch Poisson pass stays cheap; this is the "finer / model-scaled lattice".
+    n_axis = np.clip(np.ceil(ext / (0.5 * r)), 2, 64).astype(int)
+    step = tuple(ext / n_axis)
+    return Grid(dims=tuple(ext), step=step, center=tuple(center),
+                sampleArgs={"poissonDisk": (float(r), int(draw), None)})
 
 
 def _trend_up(ndim):
@@ -713,6 +739,69 @@ def _build_region_only_event(name, levels, level_pts, ndim, field_cls, field_kwa
     return ev, meta
 
 
+# the relation-matrix tag used for every "stay above an older external surface" nesting pair
+_NEST_TAG = "older-unconformity-surface"
+
+
+def _surface_ordering_iq(own_contacts, top_surface, older_surfaces):
+    """
+    The **single surface-ordering principle** of the seed-iso path (SKMB_HANDOFF §2):
+
+    > In each field, every surface point sits **above** every *older* surface point — both
+    > the field's own younger contacts and every older external surface it onlaps/truncates
+    > against.
+
+    This one builder emits all of a field's seed-iso (interface-point) ordering / nesting
+    inequalities, collapsing what used to be three separate code paths (within-package
+    contact ordering, unconformity nesting, package-top nesting) into the same relation:
+
+    * **within-field ordering** — the field's own contacts, young→old, each above the next
+      (adjacent pairs only; transitivity orders the rest);
+    * **nesting** — the field's representative *top* surface above **every** older external
+      surface, **one pair each** so the sparse margin of every older surface (where surfaces
+      converge) gets its own full ``iq_samples`` draw rather than a fraction of one pooled set.
+
+    Erosional events pass ``own_contacts=[]`` (a single surface) and their own unconformity
+    surface as ``top_surface``; depositional packages pass their internal contacts as
+    ``own_contacts`` and the package **top** as ``top_surface``.
+
+    Parameters
+    ----------
+    own_contacts : list[(key, pts)]
+        The field's own internal contacts, young→old (model coords). ``key`` tags the
+        relation's younger side.
+    top_surface : tuple(key, pts) | None
+        The field's topmost surface that must nest above the older external surfaces
+        (``None`` or empty ``pts`` ⇒ no nesting pairs).
+    older_surfaces : list[pts]
+        Older external (unconformity) surfaces this field must stay above (one array each).
+
+    Returns
+    -------
+    (iq_pairs, iq_relations)
+        ``iq_pairs`` : list[(youngerPts, olderPts, '>')];
+        ``iq_relations`` : list[(youngKey, oldKey, '>')].
+    """
+    iq_pairs, iq_relations = [], []
+    # within-field: adjacent own contacts, younger above older (transitivity does the rest)
+    for (yk, yp), (ok, op) in zip(own_contacts, own_contacts[1:]):
+        yp, op = np.asarray(yp, float), np.asarray(op, float)
+        if len(yp) and len(op):
+            iq_pairs.append((yp, op, ">"))
+            iq_relations.append((yk, ok, ">"))
+    # nesting: the top surface above every older external surface (one pair each)
+    if top_surface is not None:
+        tkey, tpts = top_surface
+        tpts = np.asarray(tpts, float)
+        if len(tpts):
+            for older in older_surfaces or ():
+                older = np.asarray(older, float)
+                if len(older):
+                    iq_pairs.append((tpts, older, ">"))
+                    iq_relations.append((tkey, _NEST_TAG, ">"))
+    return iq_pairs, iq_relations
+
+
 def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_pts,
                            ndim, field_cls, field_kwargs, iq_samples, grid, trend,
                            iface_pts=None, below_iface=None):
@@ -745,11 +834,12 @@ def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_p
     *unconstrained* deep region, so without explicit ordering a distant older unit
     (e.g. the basement) floats high and gets wrongly truncated by this unconformity.
     The above side is **pooled into one** (the onlapping package is only 1–3 capped
-    levels, so balance is safe) while the below side keeps one pool per level so
-    every older unit stays represented (SPEC §4.4) — pairs scale with ``|below|``
-    rather than ``|above| x |below|``, which is what keeps large per-epoch sample
-    counts (``iq_samples`` ~1000, GeoINR-style) tractable. The **no-overturn**
-    regularizer keeps successive surfaces nesting.
+    levels, so balance is safe) while the below side keeps **one pool per level** so every
+    older unit stays represented (SPEC §4.4) — pairs scale with ``|below|`` rather than
+    ``|above| × |below|``, which is what keeps large per-epoch sample counts tractable.
+    These per-level below pairs are the **deep-region anchors** (they keep the unconformity
+    field below every older unit's points across the data-sparse deep region); the
+    **no-overturn** regularizer keeps successive surfaces nesting.
 
     No iso-value exists at build time — the ``Overprint`` threshold is the iso
     *name* (resolved at predict), and its value is estimated after fitting by
@@ -765,21 +855,28 @@ def _build_erosional_event(name, eroded_level, above_levels, all_levels, level_p
     iq_pairs, iq_relations = [], []
     if above and below:
         above_pool = np.concatenate([pool(A) for A in above], axis=0)
+        # One pair per older level (eroded + all older). These per-level inequalities are the
+        # **deep-region anchors**: they pin the unconformity field below every older unit's
+        # points, which (with the no-overturn prior) keeps it well-behaved across the
+        # data-sparse deep regions. A 2026-06-23 experiment to pool them into one "deep"
+        # reference cut training cost but caused **volume age-inversion islands** there
+        # (2.20% of grid columns vs 0.47% with the full set) — so the full per-level set stays.
         iq_pairs = [(above_pool, pool(B), ">") for B in below]
         # relation entries carry the pooled above side as a tuple of levels
         iq_relations = [(tuple(above), B, ">") for B in below]
 
     has_iface = iface_pts is not None and len(iface_pts) > 0
 
-    # surface nesting: this unconformity's own surface sits above every older unconformity's
-    # surface (one pair each), so the older surfaces stay below this iso and are not eroded.
-    if has_iface and below_iface:
-        own = np.asarray(iface_pts, float)
-        for older_pts in below_iface:
-            older_pts = np.asarray(older_pts, float)
-            if len(older_pts):
-                iq_pairs = list(iq_pairs) + [(own, older_pts, ">")]
-                iq_relations = list(iq_relations) + [((eroded_level,), "older-unconformity-surface", ">")]
+    # surface nesting (the single §2 principle): this unconformity's own surface sits above
+    # every older unconformity's surface (one pair each), so the older surfaces stay below
+    # this iso and are not eroded. An erosional event carries a single surface, so it has no
+    # within-field contacts — only the nesting pairs.
+    if has_iface:
+        nest_pairs, nest_rels = _surface_ordering_iq(
+            own_contacts=[], top_surface=((eroded_level,), iface_pts),
+            older_surfaces=below_iface)
+        iq_pairs = list(iq_pairs) + nest_pairs
+        iq_relations = list(iq_relations) + nest_rels
 
     C = CSet(crs="model")
     if iq_pairs:
@@ -841,7 +938,12 @@ def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts
     # j+1, so name it after that older unit (a contact is the top of the unit below it).
     contact_names = [f"{unit_name(levels[j + 1])} Top" for j in range(k - 1)]
 
-    # adjacent-band ordering: band j above band j+1 (transitivity orders the whole package)
+    # adjacent-band ordering: band j above band j+1 (transitivity orders the whole package).
+    # These unit-point pairs are kept on BOTH paths (a 2026-06-23 experiment to drop them on
+    # the seed-iso path — as "redundant" with the interface ordering + CE — left band accuracy
+    # unchanged at the markers but reintroduced deep-region volume-inversion islands between
+    # them, 2.20% of grid columns vs 0.47% kept; the within-package *interface* ordering below
+    # is additional, pinning the seeded contacts in value space).
     iq_pairs, iq_relations = [], []
     for j in range(k - 1):
         if len(pool(levels[j])) and len(pool(levels[j + 1])):
@@ -858,30 +960,21 @@ def _build_depositional_iq_event(name, levels_young_to_old, unit_name, level_pts
             seed_specs.append((contact_names[j], pts))
     has_iface = len(eq_traces) > 0
 
-    # within-package contact ordering (seed-iso path): a younger contact's on-surface points
-    # sit ABOVE the next-older contact's, in this field — so the contacts keep stratigraphic
-    # order (younger surface = higher value) and cannot cross where the interface data defines
-    # them. The eq traces pin each surface's value; this iq keeps the seeded contacts ordered.
-    contact_levels = [levels[j + 1] for j in range(k - 1)]   # young → old
-    for i in range(len(contact_levels) - 1):
-        yk, ok = iface(contact_levels[i]), iface(contact_levels[i + 1])
-        if len(yk) and len(ok):
-            iq_pairs.append((np.asarray(yk, float), np.asarray(ok, float), ">"))
-            iq_relations.append((contact_levels[i], contact_levels[i + 1], ">"))
-
-    # package-top nesting: the package's TOP contact (the top of its youngest unit) is the
-    # surface a younger **baselap-onto-conformal** package onlaps. It must sit ABOVE every
-    # OLDER unconformity surface (one pair each), so the package's field stays below that
-    # threshold at the older surfaces — otherwise a younger package onlapping this top reaches
-    # down and erodes below an older surface (e.g. the Precambrian) at the basin margin.
-    top_pts = iface(levels[0])
-    if len(top_pts) and below_iface:
-        top_pts = np.asarray(top_pts, float)
-        for older_pts in below_iface:
-            older_pts = np.asarray(older_pts, float)
-            if len(older_pts):
-                iq_pairs.append((top_pts, older_pts, ">"))
-                iq_relations.append((levels[0], "older-unconformity-surface", ">"))
+    # surface ordering / nesting (the single §2 principle, one builder):
+    #   * within-package — each internal contact (the top of unit ``levels[j+1]``), young→old,
+    #     sits ABOVE the next-older one, so the seeded contacts keep stratigraphic order and
+    #     cannot cross where the interface data defines them (the eq traces pin each value);
+    #   * package-top nesting — the package's TOP surface (top of its youngest unit, the
+    #     surface a younger baselap-onto-conformal package onlaps) sits ABOVE every OLDER
+    #     unconformity surface, so the package's field stays below that threshold at the older
+    #     surfaces and a younger package onlapping the top cannot reach down and erode below an
+    #     older surface (e.g. the Precambrian) at the basin margin.
+    own_contacts = [(levels[j + 1], iface(levels[j + 1])) for j in range(k - 1)]  # young→old
+    nest_pairs, nest_rels = _surface_ordering_iq(
+        own_contacts=own_contacts, top_surface=(levels[0], iface(levels[0])),
+        older_surfaces=below_iface)
+    iq_pairs += nest_pairs
+    iq_relations += nest_rels
 
     C = CSet(crs="model")
     if iq_pairs:
@@ -952,8 +1045,12 @@ def _build_unit_only_chain(units, sfields, obs, Xm, ndim, field_cls, field_kwarg
     rng = np.random.default_rng(seed)
     level_pts = _cap_level_pools(obs, Xm, cap_per_unit, rng)
     level_name = {u.level: u.name.strip() or f"level{u.level}" for u in units}
-    # shared no-overturn grid (model coords); GeoINR-scale sampling by default
-    grid = _model_grid(Xm, ndim, n=reg_grid_n, draw=reg_samples)
+    # shared no-overturn grid (model coords). The **seed-iso / hybrid** path (interface
+    # points present, e.g. skmb) samples it with model-scaled **Poisson-disk** spacing for
+    # even, fine domain coverage — the residual basin-margin fix (SKMB_HANDOFF §4a); the
+    # **wcsb** unit-only path (no interfaces) keeps the original uniform-from-lattice draw.
+    has_iface = bool(obs.is_interface.any())
+    grid = _model_grid(Xm, ndim, n=reg_grid_n, draw=reg_samples, poisson=has_iface)
     trend = _trend_up(ndim)             # younging-up direction (+z)
 
     # on-contact (interface) points by level, in model coords (empty when none present)
@@ -1207,6 +1304,14 @@ def estimate_isosurfaces(M) -> dict:
 #: predicted column inversions low (~0.5 %); lower still (→1) fits marginally better but lets the
 #: deep unconstrained region overturn (several-% inversions in ``GeoModel.predict``'s sequential
 #: combine). 6 is the balance; tune via ``attach_unit_loss(overturn_weight=...)``.
+#:
+#: NOTE (seed-iso / hybrid path, e.g. skmb): use a **stiffer** weight (~12). There the interface
+#: ``eq`` loss hard-pins the fields at the contact surfaces, and that curvature drives deep,
+#: data-sparse regions to overturn as training continues — at 6 the predicted volume's
+#: age-inversions *grow* with epochs (over-training), at 12 they *fall* (0.36 %→0.14 % at
+#: 2000→3000 ep), i.e. robust to long training like the wcsb path. The interface ``eq`` already
+#: separates the bands, so the stiffer prior costs little band accuracy (~0.03). Set it via
+#: ``attach_unit_loss(overturn_weight=12)``.
 _COUPLED_OVERTURN_WEIGHT = 6.0
 
 

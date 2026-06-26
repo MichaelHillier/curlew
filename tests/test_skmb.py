@@ -264,3 +264,110 @@ def test_seed_package_top_nesting(hybrid):
     nest = [r for r in lower.iq_relations
             if r[0] == top_level and r[1] == "older-unconformity-surface"]
     assert nest, "onlap-target package missing top-contact nesting vs older surfaces"
+
+
+# ---------------------------------------------------------------------------
+# Goal 1 — Poisson-disk overturn sampling (seed-iso path only; wcsb unchanged)
+# ---------------------------------------------------------------------------
+def _grids(M):
+    """Per-field no-overturn grid sampleArgs (None for alias/region-only fields)."""
+    out = []
+    for m in M.field_meta:
+        C = M[m.name].getField(0).C
+        out.append(None if (C is None or C.grid is None) else C.grid.sampleArgs)
+    return [s for s in out if s is not None]
+
+
+def _wcsb_like_model(tmp_path):
+    """A tiny unit-only (no interface) model — the wcsb seed_isos=False chain path."""
+    import torch
+    from curlew.io import loadObservations
+    from curlew.geology.stratbuilder import build_geomodel
+    curlew.device = "cpu"
+    np.random.seed(0); torch.manual_seed(0); rng = np.random.default_rng(0)
+    (tmp_path / "c.csv").write_text(NESTING_CSV)
+    rows = ["x,y,z,level"]
+    for L in range(1, 5):
+        for _ in range(80):
+            x, y = rng.uniform(0, 1000, 2)
+            rows.append(f"{x},{y},{(4 - L) * 10 + rng.uniform(1, 9)},{L}")
+    (tmp_path / "u.csv").write_text("\n".join(rows))
+    obs = loadObservations(units=str(tmp_path / "u.csv"))
+    assert not obs.is_interface.any()
+    return build_geomodel(str(tmp_path / "c.csv"), obs, field="GeoINR", scale="isometric",
+                          cap_per_unit=60, iq_samples=64, reg_samples=200, reg_grid_n=8, seed=0,
+                          field_kwargs=dict(hidden_dim=16, num_hidden_layers=2,
+                                            activation=torch.nn.Softplus(beta=40)))
+
+
+def test_seed_path_uses_poisson_overturn(hybrid):
+    """The seed-iso (interface present) path samples the no-overturn grid with Poisson-disk."""
+    M, _ = hybrid
+    grids = _grids(M)
+    assert grids and all("poissonDisk" in s for s in grids), \
+        "seed-iso overturn grids should use Poisson-disk sampling"
+
+
+def test_wcsb_path_keeps_uniform_overturn(tmp_path):
+    """The unit-only (no interface) wcsb path is untouched — uniform-from-lattice sampling."""
+    M = _wcsb_like_model(tmp_path)
+    grids = _grids(M)
+    assert grids and all("N" in s and "poissonDisk" not in s for s in grids), \
+        "wcsb overturn grids must stay uniform (seed_isos=False path unchanged)"
+
+
+# ---------------------------------------------------------------------------
+# Deep-region anchors — the per-level below-side + within-package unit-point band iq are kept
+# on BOTH paths. A 2026-06-23 experiment dropped them on the seed-iso path to cut cost; it left
+# marker accuracy unchanged but reintroduced deep-region volume-inversion islands (the artifacts
+# the point metrics miss), so they stay. These tests lock that in (regression guard).
+# ---------------------------------------------------------------------------
+def test_within_package_unit_band_iq_kept(hybrid):
+    """The within-package unit-point band ordering is present on the seed-iso path (a deep-region
+    anchor; dropping it caused volume-inversion islands)."""
+    M, _ = hybrid
+    # lower package {C(3), D(4)}: the unit-band pair (3>4) must be present
+    lower = next(m for m in M.field_meta
+                 if m.kind == "depositional" and sorted(m.levels) == [3, 4])
+    assert (3, 4, ">") in lower.iq_relations, \
+        "seed path must keep the within-package unit-point band ordering (deep-region anchor)"
+
+
+def test_erosional_below_side_per_level(tmp_path):
+    """The erosional below-side keeps **one pair per older level** (the deep-region anchors), not
+    a pooled 'deep' reference — on both the wcsb and the seed-iso path."""
+    from curlew.geology.stratbuilder import _build_erosional_event
+    from curlew.fields.geoinr import GeoINR
+    from curlew.geometry import Grid
+    rng = np.random.default_rng(0)
+    # eroded level 2, with older levels 3,4,5,6 -> eroded + 4 older = 5 per-level below pairs
+    level_pts = {L: rng.uniform(-1, 1, (40, 3)) for L in range(1, 7)}
+    g = Grid(dims=(2, 2, 2), step=(0.5, 0.5, 0.5), sampleArgs={"N": 16})
+    _, meta = _build_erosional_event(
+        name="U", eroded_level=2, above_levels=[1], all_levels=list(range(1, 7)),
+        level_pts=level_pts, ndim=3, field_cls=GeoINR, field_kwargs=dict(hidden_dim=8),
+        iq_samples=16, grid=g, trend=np.array([0.0, 0.0, 1.0]))
+    below = [r for r in meta.iq_relations if isinstance(r[1], int)]
+    assert len(below) == 5, "below-side must keep one pair per older level (no pooling)"
+    assert not any(r[1] == "older-units-pooled" for r in meta.iq_relations)
+
+
+# ---------------------------------------------------------------------------
+# Goal 2 — the single surface-ordering principle (one builder)
+# ---------------------------------------------------------------------------
+def test_surface_ordering_iq_single_principle():
+    """``_surface_ordering_iq`` emits adjacent within-field ordering + top-vs-each-older nesting
+    from one place — the §2 'every surface above every older surface' principle."""
+    from curlew.geology.stratbuilder import _surface_ordering_iq, _NEST_TAG
+    own = [(10, np.zeros((3, 3))), (20, np.zeros((3, 3))), (30, np.zeros((3, 3)))]  # young->old
+    older = [np.zeros((3, 3)), np.zeros((3, 3))]                                    # 2 older surfaces
+    pairs, rels = _surface_ordering_iq(own_contacts=own, top_surface=(5, np.zeros((3, 3))),
+                                       older_surfaces=older)
+    # 2 adjacent own pairs (10>20, 20>30) + 2 nesting pairs (top 5 > each older)
+    assert rels[:2] == [(10, 20, ">"), (20, 30, ">")]
+    assert rels[2:] == [(5, _NEST_TAG, ">"), (5, _NEST_TAG, ">")]
+    assert len(pairs) == 4
+    # a single-surface (erosional) field: no within-field pairs, only nesting
+    p2, r2 = _surface_ordering_iq(own_contacts=[], top_surface=((2,), np.zeros((3, 3))),
+                                  older_surfaces=older)
+    assert len(p2) == 2 and all(r[1] == _NEST_TAG for r in r2)

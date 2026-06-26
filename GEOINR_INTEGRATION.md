@@ -170,13 +170,70 @@ unit, which forces the unconformity's field below Quaternary and above all the r
 eroded into. (`'>'` everywhere because "younger is higher-valued".) The `_FieldMeta.iq_relations`
 records the same thing in level form for the notebook's §3 listing.
 
-> ⚠️ **Under the coupling these `iq` constraints are built but _not used for the loss_.**
-> `attach_unit_loss` sets `iq_norm_weight = 0` — the cross-entropy (§5) supersedes the
-> inequalities. They survive only to **size the per-level pools** and feed the §3 inspection.
-> (A future cleanup could skip building them on the coupled path; see SOFTUNIT_STATUS.md.)
-
 A depositional package instead gets adjacent-band pairs (band *j* `>` band *j+1*); a
 region-only event gets none.
+
+> ⚠️ **The `iq` weight differs by path.** On the **unit-only (wcsb)** path
+> `attach_unit_loss` sets `iq_norm_weight = 0` — the cross-entropy (§5) supersedes the
+> inequalities, so they survive only to size the per-level pools + feed §3 inspection
+> (*vestigial*, a cleanup candidate). On the **seed-iso (skmb)** path it keeps
+> `iq_norm_weight = 1` — there the inequalities are **active loss terms** that order the
+> interface-defined surfaces where the CE is silent. The full seed-iso constraint set is
+> tabulated next.
+
+### The complete constraint set (seed-iso / skmb path)
+
+Every constraint below is **active** in the loss. The right-hand column is the key design
+point: a constraint is **redundant with the CE only when it lives on a class-owning
+(depositional) field**, because the CE classifies those bands directly; constraints on an
+**unconformity field (which owns no class)** are *not* implied by the CE — it only shapes
+that field through its onlap weight `w = σ(s·(f−θ))`.
+
+| # | constraint (`CSet`) | on field | enforces | redundant w/ CE? |
+|---|---|---|---|---|
+| `eq` | **interface** | every seeded surface | `f` == contact value at on-surface points (grad-normalised) | no — *defines* the surfaces; nothing else pins them |
+| #1 | within-package **unit-band** `iq` | depositional *(class-owning)* | younger band's unit-pts `>` older band's unit-pts | **largely yes** — CE classifies these bands ⇒ ordering implied |
+| #2 | within-package **interface** `iq` | depositional | younger contact's on-surface pts `>` next-older contact's | no — surfaces carry no CE signal |
+| #3 | **unconformity nesting** `iq` | erosional | this unconformity's surface pts `>` *each older* unconformity's (1 pair/older surface) | no — surfaces carry no CE |
+| #4 | **package-top nesting** `iq` | depositional | package's top contact `>` *each older* unconformity surface | no — the top is a baselap onlap threshold (§2) |
+| #5 | **erosional ordering** `iq` | erosional *(weight field)* | onlapping pkg's pts `>` eroded unit **and every older unit level** (1 pair/level) | **no** — unconformity field owns no class; CE only shapes it via `w` |
+| `overturn` | **no-overturn** reg. | every field | `∇f·(younging dir) ≥ 0` on the Poisson grid (weight **12** on this path, §6) | no — controls deep, data-sparse regions |
+| `CE` | **soft-unit NLL** | the global carve | unit points classified by the seeded stick-break (§5) | — *(this is the CE)* |
+
+### Visual guide to the constraints
+
+The panels below match the table rows. The repeated rule for every `iq` panel is:
+the first pool in the pair must evaluate higher than the second pool; once a pair is
+satisfied, the hinge contributes no gradient.
+
+![Depositional package constraints: eq pins interface traces, #1 orders adjacent unit-band point pools, and #2 orders adjacent interface traces.](docs/assets/geoinr-integration/constraints-interface-package-ordering.svg)
+
+*`eq` defines seeded surfaces from contact data. #1 orders unit bands in a class-owning
+package field. #2 orders the seeded contact surfaces themselves, which CE does not see.*
+
+![Surface nesting constraints: #3 keeps each younger unconformity above older unconformity surfaces, and #4 keeps package-top onlap thresholds above older unconformities.](docs/assets/geoinr-integration/constraints-surface-nesting.svg)
+
+*#3 and #4 are the cross-surface guards. They keep younger erosion/onlap thresholds from
+reaching down through older unconformities at sparse margins or in deep regions. A younger
+unconformity may still truncate an older one; the constraint is evaluated at sampled surface
+points in the relevant field.*
+
+![Erosional ordering constraint: #5 orders the onlapping package's point pool above the eroded unit and every older unit level, one pair per older level.](docs/assets/geoinr-integration/constraint-erosional-ordering.svg)
+
+*#5 is the load-bearing unit-point inequality on an erosional field: the onlapping package
+must be above the eroded unit and all older levels, not just the immediately adjacent one.*
+
+![No-overturn and soft-unit CE: monotone gradients are enforced on grid samples, while CE classifies unit points through the global seeded carve.](docs/assets/geoinr-integration/constraints-overturn-ce.svg)
+
+*`overturn` keeps each scalar field monotone between sparse observations. `CE` is not a
+`CSet` constraint, but it is the global class loss that makes the seeded carve honour the
+observed unit labels.*
+
+`eq` pins each surface to its data; #2–#4 keep the **surfaces** ordered where the data is
+silent; #5 keeps the **unconformity fields** ordered against the older column; `overturn`
+keeps every field monotone *in between*; the `CE` calibrates the unit classification. #1 is
+the one term implied by another (the `CE`) — kept to match the committed baseline, a
+removal candidate.
 
 ---
 
@@ -287,7 +344,7 @@ satisfied, so it does not fight the `eq`/CE fit — it only corrects ordering vi
 
 | knob | where | effect |
 |---|---|---|
-| `overturn_weight` | `attach_unit_loss(...)` | **the** trade-off: low → better marker fit + lower NLL, but more deep-region inversions in `predict`; high → cleaner volume, looser fit. Default **6** (per-field path uses 30). |
+| `overturn_weight` | `attach_unit_loss(...)` | **the** trade-off: low → better marker fit + lower NLL, but more deep-region inversions in `predict`; high → cleaner volume, looser fit. Default **6** (per-field path uses 30). **Seed-iso path wants ~12**: the interface `eq` hard-pins fields at the contacts, and that curvature drives deep regions to overturn as training continues — at 6 the volume inversions *grow* with epochs, at 12 they *fall* (robust to long training); the interface `eq` already separates the bands so the stiffer prior costs only ~0.03 band. |
 | `cap_per_unit` | `build_geomodel(...)` | distinct points each field sees. **Large/None** on the coupled path (balance comes from `points_per_level`, not the cap). |
 | `points_per_level` | `attach_unit_loss(...)` | balanced points/level/epoch (default 1024). |
 | `tau` | `attach_unit_loss(...)` | carve sharpness `s=1/τ` (default 0.05). |
@@ -296,11 +353,18 @@ satisfied, so it does not fight the `eq`/CE fit — it only corrects ordering vi
 
 ## 7. Known limitations & future work
 
-- **Vestigial `iq` on the coupled path.** `attach_unit_loss` zeros `iq_norm_weight`, so the
-  inequalities (§4) are *built but never used for the loss* — they only size the per-level
-  pools and feed the §3 inspection. Harmless, but a confusing artifact when you inspect a
-  field's `CSet.iq`. A future `build_geomodel` could skip building them when coupling is
-  intended (the build step doesn't currently know `attach_unit_loss` is coming).
+- **Vestigial `iq` on the _unit-only (wcsb)_ path.** There `attach_unit_loss` zeros
+  `iq_norm_weight`, so the inequalities (§4) are *built but never used for the loss* — they
+  only size the per-level pools and feed §3 inspection. Harmless but confusing when you inspect
+  a field's `CSet.iq`; a future `build_geomodel` could skip building them. **(The seed-iso /
+  skmb path is different — there `iq_norm_weight=1`, so the inequalities are active; see the §4
+  table.)**
+- **Within-package unit-band `iq` (#1) is redundant on the seed-iso path.** It orders a
+  depositional package's own bands from the *unit* points, but the CE already classifies those
+  bands (a correct classification implies the ordering). It is kept only to match the committed
+  baseline; dropping it should simplify the constraint set with no quality loss (the genuinely
+  load-bearing unit-point inequality is the erosional #5, which lives on a class-less
+  unconformity field the CE cannot imply). A one-run isolation check would confirm before removal.
 - **`overturn` is a single global knob** trading marker-fit against `predict` inversions (§6).
   A split by event kind (strong on unconformities, weak on packages) was tried and **did not**
   recover the basement — the deep leak is *iso placement*, not unconformity-field overturn — so
